@@ -36,7 +36,7 @@ export default function Home() {
   },[]);
 
   async function findModel(apiKey:string){
-    const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}&pageSize=100`);
+    const response=await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100',{headers:{'x-goog-api-key':apiKey}});
     if(!response.ok) throw new Error('번역 열쇠를 확인해 주세요.');
     const data=await response.json();
     const models:string[]=(data.models||[]).filter((item:{supportedGenerationMethods?:string[];name:string})=>item.supportedGenerationMethods?.includes('generateContent')&&/flash/.test(item.name)).map((item:{name:string})=>item.name.replace('models/',''));
@@ -49,7 +49,7 @@ export default function Home() {
     if(!key){setPanel('settings');throw new Error('먼저 번역 열쇠를 넣어 주세요.');}
     const model=await findModel(key);
     const prompt=`당신은 한국인과 일본인 연인을 돕는 통역가이자 언어 선생님이다. 첨부 음성을 정확히 받아쓴다. 입력 언어: ${sourceLanguage}. 번역 언어: ${targetLanguage}. 말투: ${tone}. 직역하지 말고 해당 나라 연인이 실제로 쓰는 자연스러운 정서로 번역한다. 원문과 번역문 모두 상대방이 읽을 수 있는 발음을 붙인다. 한국어 발음은 일본어 가타카나로, 일본어 발음은 한글로 쓴다. 더 자연스러운 추천 표현과 짧은 이유도 만든다. 다음 JSON 키만 반환: source, sourcePronunciation, translation, translationPronunciation, suggestion, suggestionPronunciation, suggestionMeaning, note`;
-    const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({contents:[{parts:[{text:prompt},{inlineData:{mimeType,data:audio}}]}],generationConfig:{responseMimeType:'application/json',temperature:.35}})});
+    const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:JSON.stringify({contents:[{parts:[{text:prompt},{inlineData:{mimeType,data:audio}}]}],generationConfig:{responseMimeType:'application/json',temperature:.35}})});
     if(!response.ok) throw new Error(response.status===429?'잠시 사용량이 몰렸습니다. 조금 뒤 다시 눌러 주세요.':'번역에 실패했습니다. 설정의 열쇠를 확인해 주세요.');
     const data=await response.json(); const raw=data.candidates?.[0]?.content?.parts?.[0]?.text;
     if(!raw) throw new Error('번역 결과를 받지 못했습니다.');
@@ -86,7 +86,7 @@ export default function Home() {
     </section>
     <section className="composer"><div className="mode-row"><button className="language" onClick={()=>setDirection(direction==='ko-ja'?'ja-ko':'ko-ja')}>{sourceLanguage} <span>⇄</span> {targetLanguage}</button><button className="tone" onClick={()=>setTone(tones[(tones.indexOf(tone)+1)%tones.length])}>{tone}⌄</button></div><button className={`mic ${listening?'active':''}`} onClick={toggleRecording} disabled={working}><span className="mic-icon">●</span><b>{working?'자연스럽게 옮기는 중…':listening?'말이 끝나면 다시 누르기':'눌러서 말하기'}</b><small>{listening?'지금 말하고, 끝나면 한 번 더 누르세요':`${sourceLanguage}로 편하게 말하세요`}</small></button><nav className="quick-actions"><button onClick={()=>setPanel('study')}><span>あ</span>오늘의 공부</button><button onClick={()=>setPanel('words')}><span>♡</span>우리 단어장</button><button onClick={()=>setPanel('memory')}><span>▣</span>추억 남기기</button></nav></section>
     {panel&&<div className="sheet-backdrop" onClick={()=>setPanel(null)}><section className="sheet" onClick={event=>event.stopPropagation()}><div className="sheet-handle"/><button className="sheet-close" onClick={()=>setPanel(null)}>닫기</button>
-      {panel==='settings'&&<><p className="sheet-kicker">처음 한 번만</p><h2>구글 번역 열쇠 넣기</h2><p className="sheet-meaning">기존 ‘둘의 말’에서 쓰던 구글 AI 열쇠를 넣으면 이 휴대폰에만 저장됩니다.</p><input className="key-input" type="password" value={draftKey} onChange={event=>setDraftKey(event.target.value)} placeholder="AIza로 시작하는 열쇠"/><button className="sheet-main" onClick={saveKey}>저장하고 실제 통역 시작</button></>}
+      {panel==='settings'&&<><p className="sheet-kicker">처음 한 번만</p><h2>구글 번역 열쇠 넣기</h2><p className="sheet-meaning">구글 AI Studio에서 만든 새 인증 열쇠를 넣으면 이 휴대폰에만 저장됩니다.</p><input className="key-input" type="password" value={draftKey} onChange={event=>setDraftKey(event.target.value)} placeholder="AQ로 시작하는 새 열쇠"/><button className="sheet-main" onClick={saveKey}>저장하고 실제 통역 시작</button></>}
       {panel==='study'&&<><p className="sheet-kicker">오늘의 한 문장</p><h2>{result.suggestion}</h2><p className="sheet-reading">{result.suggestionPronunciation}</p><p className="sheet-meaning">{result.suggestionMeaning}</p><button className="sheet-main" onClick={()=>speak(result.suggestion,direction==='ko-ja'?'ja-JP':'ko-KR')}>천천히 들어보기</button></>}
       {panel==='words'&&<><p className="sheet-kicker">우리만 아는 말</p><h2>둘만의 단어장</h2><ul className="word-list"><li><b>시오리</b><span>しおり · 사람 이름</span></li><li><b>우리 라멘집</b><span>いつものラーメン屋 · 늘 가는 곳</span></li></ul><button className="sheet-main">새 단어 넣기</button></>}
       {panel==='memory'&&<><p className="sheet-kicker">오늘의 대화</p><h2>오늘 말을 추억으로</h2><p className="memory-copy">“{result.source}”<br/>마지막 대화는 이 휴대폰에 자동으로 남아 있습니다.</p><button className="sheet-main" onClick={()=>setPanel(null)}>확인</button></>}
