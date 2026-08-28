@@ -37,17 +37,21 @@ export default function Home() {
 
   async function translateAudio(audio:string,mimeType:string){
     if(!key){setPanel('settings');throw new Error('먼저 번역 열쇠를 넣어 주세요.');}
-    const model='gemini-3.7-flash';
     const prompt=`당신은 한국인과 일본인 연인을 돕는 통역가이자 언어 선생님이다. 첨부 음성을 정확히 받아쓴다. 입력 언어: ${sourceLanguage}. 번역 언어: ${targetLanguage}. 말투: ${tone}. 직역하지 말고 해당 나라 연인이 실제로 쓰는 자연스러운 정서로 번역한다. 원문과 번역문 모두 상대방이 읽을 수 있는 발음을 붙인다. 한국어 발음은 일본어 가타카나로, 일본어 발음은 한글로 쓴다. 더 자연스러운 추천 표현과 짧은 이유도 만든다. 다음 JSON 키만 반환: source, sourcePronunciation, translation, translationPronunciation, suggestion, suggestionPronunciation, suggestionMeaning, note`;
-    const controller=new AbortController();
-    const timer=window.setTimeout(()=>controller.abort(),20000);
-    let response:Response;
-    try{
-      response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},signal:controller.signal,body:JSON.stringify({contents:[{parts:[{text:prompt},{inlineData:{mimeType,data:audio}}]}],generationConfig:{responseMimeType:'application/json',temperature:.25,maxOutputTokens:600}})});
-    }catch(caught){
-      if(caught instanceof DOMException&&caught.name==='AbortError') throw new Error('20초 동안 답이 없어 멈췄습니다. 다시 말해 주세요.');
-      throw new Error('구글 번역 서버에 연결하지 못했습니다. 잠시 뒤 다시 눌러 주세요.');
-    }finally{window.clearTimeout(timer);}
+    const models=['gemini-3.7-flash','gemini-3.5-flash','gemini-2.5-flash'];
+    let response:Response|undefined;
+    for(const model of models){
+      const controller=new AbortController();
+      const timer=window.setTimeout(()=>controller.abort(),10000);
+      try{
+        const attempt=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},signal:controller.signal,body:JSON.stringify({contents:[{parts:[{text:prompt},{inlineData:{mimeType,data:audio}}]}],generationConfig:{responseMimeType:'application/json',temperature:.25,maxOutputTokens:600}})});
+        response=attempt;
+        if(attempt.ok||![429,500,502,503,504].includes(attempt.status)) break;
+      }catch(caught){
+        if(!(caught instanceof DOMException&&caught.name==='AbortError')) throw new Error('구글 번역 서버에 연결하지 못했습니다. 잠시 뒤 다시 눌러 주세요.');
+      }finally{window.clearTimeout(timer);}
+    }
+    if(!response) throw new Error('번역 서버가 30초 동안 답하지 않았습니다. 다시 눌러 주세요.');
     if(!response.ok){
       if(response.status===429) throw new Error('잠시 사용량이 몰렸습니다. 조금 뒤 다시 눌러 주세요.');
       if(response.status===401||response.status===403) throw new Error('구글이 이 열쇠의 사용을 거절했습니다. 새 열쇠가 저장됐는지 확인해 주세요.');
