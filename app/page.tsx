@@ -35,22 +35,16 @@ export default function Home() {
     if(savedResult){ try{setResult(JSON.parse(savedResult));}catch{} }
   },[]);
 
-  async function findModel(apiKey:string){
-    const response=await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100',{headers:{'x-goog-api-key':apiKey}});
-    if(!response.ok) throw new Error('번역 열쇠를 확인해 주세요.');
-    const data=await response.json();
-    const models:string[]=(data.models||[]).filter((item:{supportedGenerationMethods?:string[];name:string})=>item.supportedGenerationMethods?.includes('generateContent')&&/flash/.test(item.name)).map((item:{name:string})=>item.name.replace('models/',''));
-    const preferred=models.find(name=>/2\.5-flash$/.test(name))||models.find(name=>/flash-latest/.test(name))||models[0];
-    if(!preferred) throw new Error('사용할 수 있는 번역 모델이 없습니다.');
-    return preferred;
-  }
-
   async function translateAudio(audio:string,mimeType:string){
     if(!key){setPanel('settings');throw new Error('먼저 번역 열쇠를 넣어 주세요.');}
-    const model=await findModel(key);
+    const model='gemini-3.7-flash';
     const prompt=`당신은 한국인과 일본인 연인을 돕는 통역가이자 언어 선생님이다. 첨부 음성을 정확히 받아쓴다. 입력 언어: ${sourceLanguage}. 번역 언어: ${targetLanguage}. 말투: ${tone}. 직역하지 말고 해당 나라 연인이 실제로 쓰는 자연스러운 정서로 번역한다. 원문과 번역문 모두 상대방이 읽을 수 있는 발음을 붙인다. 한국어 발음은 일본어 가타카나로, 일본어 발음은 한글로 쓴다. 더 자연스러운 추천 표현과 짧은 이유도 만든다. 다음 JSON 키만 반환: source, sourcePronunciation, translation, translationPronunciation, suggestion, suggestionPronunciation, suggestionMeaning, note`;
     const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:JSON.stringify({contents:[{parts:[{text:prompt},{inlineData:{mimeType,data:audio}}]}],generationConfig:{responseMimeType:'application/json',temperature:.35}})});
-    if(!response.ok) throw new Error(response.status===429?'잠시 사용량이 몰렸습니다. 조금 뒤 다시 눌러 주세요.':'번역에 실패했습니다. 설정의 열쇠를 확인해 주세요.');
+    if(!response.ok){
+      if(response.status===429) throw new Error('잠시 사용량이 몰렸습니다. 조금 뒤 다시 눌러 주세요.');
+      if(response.status===401||response.status===403) throw new Error('구글이 이 열쇠의 사용을 거절했습니다. 새 열쇠가 저장됐는지 확인해 주세요.');
+      throw new Error(`번역 연결에 실패했습니다. 오류 번호 ${response.status}`);
+    }
     const data=await response.json(); const raw=data.candidates?.[0]?.content?.parts?.[0]?.text;
     if(!raw) throw new Error('번역 결과를 받지 못했습니다.');
     const parsed=JSON.parse(raw) as Result; setResult(parsed);setAdopted(false);localStorage.setItem('duri-last-result',JSON.stringify(parsed));
