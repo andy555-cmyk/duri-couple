@@ -4,7 +4,7 @@ import './globals.css';
 export const metadata: Metadata = {
   title: '둘의 말 — 한일 커플을 위한 대화',
   description: '말하고, 배우고, 함께 기억하는 한일 커플 전용 대화 앱',
-  metadataBase: new URL('https://duri-couple.sites.openai.com'),
+  metadataBase: new URL('https://duri-couple.andyleee.chatgpt.site'),
   openGraph: {
     title: '둘의 말',
     description: '말하고, 배우고, 함께 기억하는 한일 커플 앱',
