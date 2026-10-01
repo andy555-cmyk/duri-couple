@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { dictKeys, errorKey, makeT } from '../src/lib/i18n';
 import {
+  cleanReading,
+  looksLike,
+  stripFurigana,
+  validateDaily,
+  validateTalk,
+  validateUnderstand,
+  validateWrite,
   contextLines,
   daysTogether,
   systemPrompt,
@@ -87,7 +94,7 @@ describe('turn mapping', () => {
     const turn = turnFromUnderstand(
       { lang: 'ja', translation: '언제 와?', koKana: '', jaHangul: 'イツ クルノ', nuance: '기다리는 느낌', words: [{ w: 'いつ', r: '이츠', m: '언제' }], replies: [{ text: 'すぐ行く', reading: '스구 이쿠', meaning: '금방 갈게' }] },
       'いつ来るの？',
-      { model: 'm', ms: 1, id: 'x', ts: 1 },
+      { model: 'm', ms: 1, id: 'x', ts: 1, myLang: 'ko' },
     );
     expect(turn).toMatchObject({ channel: 'msg-in', ja: 'いつ来るの？', ko: '언제 와?' });
     expect(turn.lines?.[0].text).toBe('すぐ行く');
@@ -132,5 +139,46 @@ describe('store helpers', () => {
     const backup = parseBackup(JSON.stringify({ app: 'duri-couple', turns: [{ id: 'a', ts: 2 }], phrases: [], glossary: [] }));
     expect(mergeById([{ id: 'b', ts: 1 }], backup.turns as any).map((x: any) => x.id)).toEqual(['b', 'a']);
     expect(() => parseBackup('{"app":"other"}')).toThrow();
+  });
+});
+
+describe('catching wrong-language answers (real Gemini mistakes, 2026-10-02)', () => {
+  it('tells the scripts apart, tolerating a quoted word', () => {
+    expect(looksLike('今日いつものラーメン屋行かない？', 'ja')).toBe(true);
+    expect(looksLike('7시에 끝나요. 끝나면 바로 갈게요', 'ja')).toBe(false);
+    expect(looksLike('오늘 우리 라멘집 갈래?', 'ko')).toBe(true);
+    expect(looksLike('今日終わったら우리 라멘집に行く？', 'ja')).toBe(true);
+    expect(looksLike('', 'ko')).toBe(false);
+  });
+  it('rejects readings in the wrong script', () => {
+    expect(cleanReading('オヌㇽ チンチャ チェミイッソッソ', 'kana')).toBe('オヌㇽ チンチャ チェミイッソッソ');
+    expect(cleanReading('オヌㇰ チイン짜 コマワッソ. タウㇺ 주에 또 만나자.', 'kana')).toBe('');
+    expect(cleanReading('쿄ー와 혼토ー니 아리가토네', 'hangul')).toBe('쿄ー와 혼토ー니 아리가토네');
+    expect(cleanReading('일주일 동안 今日', 'hangul')).toBe('');
+  });
+  it('strips furigana', () => {
+    expect(stripFurigana('今日(きょう)は本当(ほんとう)にありがとね。来週（らいしゅう）')).toBe('今日は本当にありがとね。来週');
+  });
+  it('flags replies written in the reader\'s own language', () => {
+    const bad = { lang: 'ja' as const, translation: '오늘 몇 시에 끝나?', koKana: '', jaHangul: '', nuance: '', words: [], replies: [{ text: '나도 시오리 빨리 보고 싶어!', reading: '', meaning: '' }] };
+    expect(validateUnderstand(bad, andy)).toBe('replies');
+    const good = { ...bad, replies: [{ text: '俺も早く会いたい！', reading: '오레모 하야쿠 아이타이!', meaning: '나도 빨리 보고 싶어!' }] };
+    expect(validateUnderstand(good, andy)).toBeNull();
+  });
+  it('flags message drafts in the wrong language', () => {
+    const bad = { said: '7시에 끝나', lines: [{ label: '기본', text: '7시에 끝나요', reading: '나나지니 오와루', meaning: '', why: '' }], myKana: '', note: '' };
+    expect(validateWrite(bad, andy)).toBe('lines');
+    expect(validateWrite({ ...bad, lines: [{ ...bad.lines[0], text: '7時に終わるよ' }] }, andy)).toBeNull();
+  });
+  it('flags a daily line in the learner\'s own language', () => {
+    expect(validateDaily({ line: '보고 싶었어', meaning: '보고 싶었어', koKana: '', jaHangul: '', note: '' }, andy)).toBe('line');
+    expect(validateDaily({ line: '会いたかった', meaning: '보고 싶었어', koKana: '', jaHangul: '', note: '' }, andy)).toBeNull();
+  });
+  it('checks talk answers', () => {
+    const base = { heard: true, lang: 'ko' as const, said: '고마워', translation: 'ありがとう', koKana: 'コマウォ', jaHangul: '아리가토ー', alt: '', altReading: '', altMeaning: '', altWhy: '', note: '' };
+    expect(validateTalk(base)).toBeNull();
+    expect(validateTalk({ ...base, translation: '고마워' })).toBe('translation');
+    expect(validateTalk({ ...base, koKana: '코마워' })).toBe('koKana');
+    expect(validateTalk({ ...base, heard: false, said: '' })).toBeNull();
   });
 });

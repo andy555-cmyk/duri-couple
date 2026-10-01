@@ -114,6 +114,67 @@ describe('callGemini fallback', () => {
   });
 });
 
+describe('validation', () => {
+  const models = MODELS.slice(0, 3);
+  it('moves to the next model when an answer fails validation', async () => {
+    const { impl } = fakeFetch([ok({ lang: 'xx' }), ok({ lang: 'ja' })]);
+    const result = await callGemini<{ lang: string }>({ key: 'k', system: 's', parts: [], models, fetchImpl: impl, validate: (d) => (d.lang === 'ja' ? null : 'lang') });
+    expect(result.data.lang).toBe('ja');
+    expect(result.model).toBe(models[1].id);
+    expect(result.invalid).toBeUndefined();
+  });
+  it('returns the best invalid attempt rather than nothing', async () => {
+    const { impl } = fakeFetch([ok({ lang: 'xx' }), fail(503, 'busy'), fail(503, 'busy')]);
+    const result = await callGemini<{ lang: string }>({ key: 'k', system: 's', parts: [], models, fetchImpl: impl, validate: () => 'lang' });
+    expect(result.invalid).toBe('lang');
+    expect(result.model).toBe(models[0].id);
+    expect(result.failure).toBe('busy');
+  });
+});
+
+describe('hedging slow models', () => {
+  const models = MODELS.slice(0, 3);
+  /** Each entry answers after `delay` ms unless its request is cancelled first. */
+  function timedFetch(entries: { delay: number; body: unknown }[]) {
+    const aborted: string[] = [];
+    const impl = ((url: string, init: RequestInit) => {
+      const entry = entries.shift()!;
+      const model = url.split('/models/')[1].split(':')[0];
+      return new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(ok(entry.body)), entry.delay);
+        init.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          aborted.push(model);
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    }) as unknown as typeof fetch;
+    return { impl, aborted };
+  }
+  it('starts the next model when the first is slow, takes the first answer and cancels the other', async () => {
+    const { impl, aborted } = timedFetch([
+      { delay: 400, body: { from: 'slow' } },
+      { delay: 20, body: { from: 'fast' } },
+    ]);
+    const result = await callGemini<{ from: string }>({ key: 'k', system: 's', parts: [], models, hedgeMs: 50, fetchImpl: impl });
+    expect(result.data.from).toBe('fast');
+    expect(result.model).toBe(models[1].id);
+    expect(aborted).toEqual([models[0].id]);
+  });
+  it('does not hedge when the first model is quick', async () => {
+    const { impl } = timedFetch([{ delay: 10, body: { from: 'first' } }]);
+    const result = await callGemini<{ from: string }>({ key: 'k', system: 's', parts: [], models, hedgeMs: 200, fetchImpl: impl });
+    expect(result.model).toBe(models[0].id);
+  });
+  it('can be cancelled by the caller', async () => {
+    const { impl } = timedFetch([{ delay: 500, body: {} }]);
+    const controller = new AbortController();
+    const pending = callGemini({ key: 'k', system: 's', parts: [], models, fetchImpl: impl, signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ kind: 'aborted' });
+  });
+});
+
 describe('model order', () => {
   it('puts the last good model first and cooling ones last', () => {
     const now = 1_000_000;

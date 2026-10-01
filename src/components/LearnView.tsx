@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { blobToBase64, callGemini, GeminiError } from '../lib/gemini';
+import { blobToBase64, callGemini, failureOf, GeminiError } from '../lib/gemini';
 import {
   DAILY_SCHEMA,
   dailyFrom,
@@ -10,6 +10,8 @@ import {
   TALK_SCHEMA,
   talkPrompt,
   turnFromTalk,
+  validateDaily,
+  validateTalk,
   type DailyJson,
   type PronounceJson,
   type TalkJson,
@@ -79,8 +81,11 @@ export function LearnView() {
           },
         ],
         schema: DAILY_SCHEMA,
+        validate: (data) => validateDaily(data, app.profile),
+        hedgeMs: 8000,
         temperature: 0.9,
       });
+      if (result.invalid) throw failureOf(result);
       app.setDaily(dailyFrom(result.data, app.profile, today));
     } catch (caught) {
       fail(caught);
@@ -245,6 +250,7 @@ function PronounceSheet({ card, onClose }: { card: Card; onClose: () => void }) 
           ],
           schema: PRONOUNCE_SCHEMA,
           timeoutMs: 30000,
+          hedgeMs: 10000,
         });
         setResult(res.data);
       } catch (caught) {
@@ -419,7 +425,10 @@ function AddPhraseSheet({ onClose }: { onClose: () => void }) {
         system: systemPrompt(app.profile, app.glossary),
         parts: [{ text: talkPrompt({ profile: app.profile, turns: [], tone: app.settings.tone, text: clean }) }],
         schema: TALK_SCHEMA,
+        validate: validateTalk,
+        hedgeMs: 7000,
       });
+      if (result.invalid === 'said' || result.invalid === 'translation') throw failureOf(result);
       const turn = turnFromTalk(result.data, { input: 'text', model: result.model, ms: result.ms, id: uid(), ts: Date.now() });
       app.setPhrases((prev) => [phraseFrom(turn), ...prev]);
       app.toast(t('toast.saved'));

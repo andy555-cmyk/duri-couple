@@ -254,6 +254,7 @@ function WordSheet({ item, onClose }: { item: GlossaryItem | null; onClose: () =
           parts: [{ text: fillPrompt({ ko: k, ja: j, note: noteText }) }],
           schema: FILL_SCHEMA,
           maxTokens: 1024,
+          hedgeMs: 7000,
         });
         k = k || String(result.data.ko || '').trim();
         j = j || String(result.data.ja || '').trim();

@@ -43,11 +43,17 @@ const log = (title, value) => {
 // 1) which models answer at all
 for (const spec of g.MODELS) log(`probe ${spec.id}`, await g.probeModel(key, spec));
 
+const VALIDATE = {
+  [JSON.stringify(p.TALK_SCHEMA)]: p.validateTalk,
+  [JSON.stringify(p.UNDERSTAND_SCHEMA)]: (d) => p.validateUnderstand(d, profile),
+  [JSON.stringify(p.WRITE_SCHEMA)]: (d) => p.validateWrite(d, profile),
+  [JSON.stringify(p.DAILY_SCHEMA)]: (d) => p.validateDaily(d, profile),
+};
 const call = async (title, parts, schema, timeoutMs = 30000) => {
   const started = Date.now();
   try {
-    const result = await g.callGemini({ key, system, parts, schema, timeoutMs });
-    log(`${title} · ${result.model} · ${Date.now() - started}ms`, result.data);
+    const result = await g.callGemini({ key, system, parts, schema, timeoutMs, hedgeMs: 8000, validate: VALIDATE[JSON.stringify(schema)] });
+    log(`${title} · ${result.model} · ${Date.now() - started}ms${result.invalid ? ` · INVALID ${result.invalid}` : ''}`, result.data);
     return result.data;
   } catch (error) {
     log(`${title} · FAILED`, { kind: error.kind, status: error.status, detail: error.detail });

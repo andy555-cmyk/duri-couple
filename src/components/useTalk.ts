@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import type { Recording } from '../lib/audio';
-import { blobToBase64, callGemini, GeminiError, type Part } from '../lib/gemini';
-import { systemPrompt, TALK_SCHEMA, talkPrompt, turnFromTalk, type TalkJson } from '../lib/prompts';
+import { blobToBase64, callGemini, failureOf, GeminiError, type Part } from '../lib/gemini';
+import { systemPrompt, TALK_SCHEMA, talkPrompt, turnFromTalk, validateTalk, type TalkJson } from '../lib/prompts';
 import { speak } from '../lib/speech';
 import { uid } from '../lib/store';
 import type { Lang, Turn } from '../lib/types';
@@ -63,11 +63,14 @@ export function useTalk() {
         system: systemPrompt(a.profile, a.glossary),
         parts,
         schema: TALK_SCHEMA,
+        validate: validateTalk,
         timeoutMs: input.audio ? 30000 : 20000,
+        hedgeMs: input.audio ? 10000 : 7000,
         signal: controller.signal,
         onModel: setModel,
       });
       if (result.data.heard === false || !String(result.data.said || '').trim()) throw new GeminiError('silence');
+      if (result.invalid === 'said' || result.invalid === 'translation') throw failureOf(result);
       const turn: Turn = turnFromTalk(result.data, {
         input: input.audio ? 'voice' : 'text',
         model: result.model,

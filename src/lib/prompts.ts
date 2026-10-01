@@ -2,6 +2,38 @@ import type { Daily, GlossaryItem, Lang, Line, Profile, Tone, Turn, Word } from 
 import { other } from './types';
 
 const LANG = { ko: 'Korean', ja: 'Japanese' } as const;
+
+/* ---------- script checks: catch answers written in the wrong language ---------- */
+
+const count = (text: string, re: RegExp) => (text.match(re) || []).length;
+const HANGUL = /[\uac00-\ud7a3\u3131-\u318e]/g;
+const KANA = /[\u3041-\u3096\u30a1-\u30fa\u31f0-\u31ff]/g;
+const KANJI = /[\u4e00-\u9fff\u3005]/g;
+
+/** True when the text is mostly written in that language's script (a quoted word from the other language is fine). */
+export function looksLike(text: string, lang: Lang): boolean {
+  const hangul = count(text, HANGUL);
+  const japanese = count(text, KANA) + count(text, KANJI);
+  if (lang === 'ko') return hangul > 0 && hangul > japanese;
+  return japanese > 0 && japanese > hangul;
+}
+
+/** koKana must be katakana, jaHangul must be hangul. Empty readings are allowed. */
+export function readingOk(text: string, script: 'kana' | 'hangul'): boolean {
+  if (!text.trim()) return true;
+  const hangul = count(text, HANGUL);
+  const kana = count(text, KANA);
+  return script === 'kana' ? kana > 0 && hangul === 0 : hangul > 0 && kana + count(text, KANJI) === 0;
+}
+
+/** Keeps a reading only if it is in the right script; a wrong one is worse than none. */
+export const cleanReading = (text: string | undefined, script: 'kana' | 'hangul') => {
+  const value = (text || '').trim();
+  return readingOk(value, script) ? value : '';
+};
+
+/** Removes furigana like 今日(きょう) that weaker models sometimes add. */
+export const stripFurigana = (text: string) => text.replace(/([\u4e00-\u9fff\u3005]+)[(（][\u3041-\u3096\u30a1-\u30faー]+[)）]/g, '$1');
 const SCRIPT = { ko: 'hangul', ja: 'katakana' } as const;
 
 const TONE: Record<Tone, string> = {
@@ -148,10 +180,10 @@ export function talkPrompt(opts: {
     `Return JSON with exactly these keys:`,
     `- heard: false only if there is no intelligible Korean or Japanese speech (then all text fields are "").`,
     `- lang: "ko" or "ja", the language that was spoken/written.`,
-    `- said: exactly what was said, in its own language, with clean punctuation.`,
-    `- translation: the natural translation into the other language.`,
-    `- koKana: katakana reading of the Korean text (said if lang is ko, otherwise translation).`,
-    `- jaHangul: hangul reading of the Japanese text (said if lang is ja, otherwise translation).`,
+    `- said: exactly what was said, in its own language and script, with clean punctuation.`,
+    `- translation: the natural translation into the other language (Korean → Japanese, Japanese → Korean). Plain text, no furigana or brackets.`,
+    `- koKana: katakana ONLY (no hangul) reading of the Korean text (said if lang is ko, otherwise translation).`,
+    `- jaHangul: hangul ONLY (no kana, no kanji) reading of the Japanese text (said if lang is ja, otherwise translation).`,
     `- alt: ONE line in the other language that a native lover would really say for the same intent, in the wanted tone. Same meaning, may be warmer or more idiomatic. "" if translation is already ideal.`,
     `- altReading: reading of alt (hangul if alt is Japanese, katakana if alt is Korean), else "".`,
     `- altMeaning: alt translated back into the speaker's language, else "".`,
@@ -160,11 +192,22 @@ export function talkPrompt(opts: {
   ].join('\n');
 }
 
+export function validateTalk(json: TalkJson): string | null {
+  if (json.heard === false) return null;
+  const lang: Lang = json.lang === 'ja' ? 'ja' : 'ko';
+  if (!looksLike(json.said || '', lang)) return 'said';
+  if (!looksLike(json.translation || '', other(lang))) return 'translation';
+  if (!readingOk(json.koKana || '', 'kana')) return 'koKana';
+  if (!readingOk(json.jaHangul || '', 'hangul')) return 'jaHangul';
+  return null;
+}
+
 export function turnFromTalk(json: TalkJson, meta: { channel?: Turn['channel']; input: Turn['input']; model: string; ms: number; id: string; ts: number }): Turn {
   const lang: Lang = json.lang === 'ja' ? 'ja' : 'ko';
-  const said = (json.said || '').trim();
-  const translation = (json.translation || '').trim();
-  const alt = (json.alt || '').trim();
+  const said = stripFurigana((json.said || '').trim());
+  const translation = stripFurigana((json.translation || '').trim());
+  let alt = stripFurigana((json.alt || '').trim());
+  if (alt && !looksLike(alt, other(lang))) alt = '';
   const sameAsTranslation = alt && alt.replace(/[\s。.!！?？、,]/g, '') === translation.replace(/[\s。.!！?？、,]/g, '');
   return {
     id: meta.id,
@@ -174,8 +217,8 @@ export function turnFromTalk(json: TalkJson, meta: { channel?: Turn['channel']; 
     input: meta.input,
     ko: lang === 'ko' ? said : translation,
     ja: lang === 'ja' ? said : translation,
-    koKana: (json.koKana || '').trim(),
-    jaHangul: (json.jaHangul || '').trim(),
+    koKana: cleanReading(json.koKana, 'kana'),
+    jaHangul: cleanReading(json.jaHangul, 'hangul'),
     alt:
       alt && !sameAsTranslation
         ? {
@@ -245,15 +288,24 @@ export function understandPrompt(opts: { profile: Profile; turns: Turn[]; text: 
     `Return JSON with exactly these keys:`,
     `- lang: "ko" or "ja", the language the message is written in.`,
     `- translation: natural translation into the other language.`,
-    `- koKana: katakana reading of the Korean text (message or translation).`,
-    `- jaHangul: hangul reading of the Japanese text (message or translation).`,
+    `- koKana: katakana ONLY reading of the Korean text (message or translation).`,
+    `- jaHangul: hangul ONLY reading of the Japanese text (message or translation).`,
     `- nuance: 1–2 short sentences in ${LANG[mine]}: the feeling and intent behind it (e.g. teasing, a little sulky, wants attention, just casual) and anything easy to misread. If the message is written in ${LANG[mine]} (the partner practising), praise kindly and point out anything unnatural.`,
     `- words: up to 4 useful words or expressions from the message: w = as written, r = reading in ${SCRIPT[mine]}, m = meaning in ${LANG[mine]}. [] if none worth learning.`,
-    `- replies: 3 short natural replies ${n.me} could send back, written in ${LANG[theirs]}, different in feel (sweet / playful / simple): text, reading in ${SCRIPT[mine]}, meaning in ${LANG[mine]}.`,
+    `- replies: 3 short natural replies that ${n.me} (the reader) could send back to ${n.partner}, spoken in ${n.me}'s voice. text MUST be written in ${LANG[theirs]} (never ${LANG[mine]}) so ${n.partner} can read it; vary the feel (sweet / playful / simple). reading = reading of text in ${SCRIPT[mine]} only; meaning = text translated into ${LANG[mine]}.`,
   ].join('\n');
 }
 
-export function turnFromUnderstand(json: UnderstandJson, text: string, meta: { model: string; ms: number; id: string; ts: number }): Turn {
+export function validateUnderstand(json: UnderstandJson, profile: Profile): string | null {
+  const lang: Lang = json.lang === 'ko' ? 'ko' : 'ja';
+  if (!looksLike(json.translation || '', other(lang))) return 'translation';
+  const theirs = other(profile.myLang);
+  if (!(json.replies || []).length || json.replies.some((r) => !looksLike(r?.text || '', theirs))) return 'replies';
+  if (!readingOk(json.koKana || '', 'kana') || !readingOk(json.jaHangul || '', 'hangul')) return 'reading';
+  return null;
+}
+
+export function turnFromUnderstand(json: UnderstandJson, text: string, meta: { model: string; ms: number; id: string; ts: number; myLang: Lang }): Turn {
   const lang: Lang = json.lang === 'ko' ? 'ko' : 'ja';
   return {
     id: meta.id,
@@ -261,13 +313,16 @@ export function turnFromUnderstand(json: UnderstandJson, text: string, meta: { m
     lang,
     channel: 'msg-in',
     input: 'text',
-    ko: lang === 'ko' ? text : (json.translation || '').trim(),
-    ja: lang === 'ja' ? text : (json.translation || '').trim(),
-    koKana: (json.koKana || '').trim(),
-    jaHangul: (json.jaHangul || '').trim(),
+    ko: lang === 'ko' ? text : stripFurigana((json.translation || '').trim()),
+    ja: lang === 'ja' ? text : stripFurigana((json.translation || '').trim()),
+    koKana: cleanReading(json.koKana, 'kana'),
+    jaHangul: cleanReading(json.jaHangul, 'hangul'),
     nuance: (json.nuance || '').trim() || undefined,
     words: (json.words || []).filter((w) => w?.w).slice(0, 4),
-    lines: (json.replies || []).filter((r) => r?.text).slice(0, 3),
+    lines: (json.replies || [])
+      .filter((r) => r?.text && looksLike(r.text, other(meta.myLang)))
+      .slice(0, 3)
+      .map((r) => ({ ...r, text: stripFurigana(r.text) })),
     model: meta.model,
     ms: meta.ms,
   };
@@ -315,9 +370,9 @@ export function writePrompt(opts: {
     ``,
     `Return JSON with exactly these keys:`,
     `- said: what ${n.me} wants to say, cleaned up, in ${LANG[mine]}.`,
-    `- lines: exactly 3 messages written in ${LANG[theirs]} the way a native ${LANG[theirs]} lover would actually text it:`,
+    `- lines: exactly 3 messages, each text written in ${LANG[theirs]} (never ${LANG[mine]}), the way a native ${LANG[theirs]} lover would actually text it, in ${n.me}'s voice:`,
     `  1) faithful and natural, 2) in the wanted tone, 3) shorter and more casual. Each has:`,
-    `  label = 2–4 words in ${LANG[mine]} naming the style; text; reading = reading of text in ${SCRIPT[mine]}; meaning = back-translation into ${LANG[mine]}; why = at most one short sentence in ${LANG[mine]}.`,
+    `  label = 2–4 words in ${LANG[mine]} naming the style; text (in ${LANG[theirs]}); reading = reading of text in ${SCRIPT[mine]} only; meaning = back-translation into ${LANG[mine]}; why = at most one short sentence in ${LANG[mine]}.`,
     `- myKana: reading of "said" in ${SCRIPT[theirs]} (katakana for Korean, hangul for Japanese).`,
     `- note: "" or one short tip in ${LANG[mine]} if something could be misread.`,
   ]
@@ -325,9 +380,20 @@ export function writePrompt(opts: {
     .join('\n');
 }
 
+export function validateWrite(json: WriteJson, profile: Profile): string | null {
+  const lines = json.lines || [];
+  const theirs = other(profile.myLang);
+  if (!lines.length || lines.some((l) => !looksLike(l?.text || '', theirs))) return 'lines';
+  if (lines.some((l) => !readingOk(l?.reading || '', profile.myLang === 'ko' ? 'hangul' : 'kana'))) return 'reading';
+  return null;
+}
+
 export function turnFromWrite(json: WriteJson, meta: { profile: Profile; input: Turn['input']; model: string; ms: number; id: string; ts: number }): Turn {
   const mine = meta.profile.myLang;
-  const lines = (json.lines || []).filter((l) => l?.text).slice(0, 3);
+  const lines = (json.lines || [])
+    .filter((l) => l?.text && looksLike(l.text, other(mine)))
+    .slice(0, 3)
+    .map((l) => ({ ...l, text: stripFurigana(l.text) }));
   const first = lines[0] || { text: '', reading: '' };
   const said = (json.said || '').trim();
   return {
@@ -338,8 +404,8 @@ export function turnFromWrite(json: WriteJson, meta: { profile: Profile; input: 
     input: meta.input,
     ko: mine === 'ko' ? said : first.text,
     ja: mine === 'ja' ? said : first.text,
-    koKana: mine === 'ko' ? (json.myKana || '').trim() : first.reading,
-    jaHangul: mine === 'ja' ? (json.myKana || '').trim() : first.reading,
+    koKana: mine === 'ko' ? cleanReading(json.myKana, 'kana') : cleanReading(first.reading, 'kana'),
+    jaHangul: mine === 'ja' ? cleanReading(json.myKana, 'hangul') : cleanReading(first.reading, 'hangul'),
     lines,
     note: (json.note || '').trim() || undefined,
     model: meta.model,
@@ -410,7 +476,7 @@ export function dailyPrompt(opts: { profile: Profile; turns: Turn[]; known: stri
     `Today is ${date}; the season or a nearby holiday in Korea/Japan may inspire it. Avoid lines they already know: ${opts.known.slice(0, 30).join(' / ') || '(none)'}.`,
     ``,
     `Return JSON with exactly these keys:`,
-    `- line: the line in ${LANG[theirs]}.`,
+    `- line: the line, written in ${LANG[theirs]} (never ${LANG[mine]}), in ${n.me}'s voice speaking to ${n.partner}.`,
     `- meaning: its meaning in ${LANG[mine]}.`,
     `- koKana: katakana reading of the Korean text (line or meaning).`,
     `- jaHangul: hangul reading of the Japanese text (line or meaning).`,
@@ -418,12 +484,18 @@ export function dailyPrompt(opts: { profile: Profile; turns: Turn[]; known: stri
   ].join('\n');
 }
 
+export function validateDaily(json: DailyJson, profile: Profile): string | null {
+  if (!looksLike(json.line || '', other(profile.myLang))) return 'line';
+  if (!looksLike(json.meaning || '', profile.myLang)) return 'meaning';
+  return null;
+}
+
 export function dailyFrom(json: DailyJson, profile: Profile, date: string): Daily {
   const theirs = other(profile.myLang);
   return {
     date,
-    ko: theirs === 'ko' ? json.line : json.meaning,
-    ja: theirs === 'ja' ? json.line : json.meaning,
+    ko: stripFurigana(theirs === 'ko' ? json.line : json.meaning),
+    ja: stripFurigana(theirs === 'ja' ? json.line : json.meaning),
     koKana: json.koKana || '',
     jaHangul: json.jaHangul || '',
     note: json.note || '',

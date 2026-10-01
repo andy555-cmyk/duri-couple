@@ -18,13 +18,16 @@ export interface ModelSpec {
   thinking: ThinkingLevel;
 }
 
+// Order from a real head-to-head on 2026-10-02 (tools/compare-models.mjs): 3.5-flash was the only model
+// that was both available and correct on every task; 3.8/3.7/latest were often 503 on the free tier;
+// minimal thinking (3.6) and flash-lite wrote replies in the wrong language, so lite is last resort.
 export const MODELS: ModelSpec[] = [
-  { id: 'gemini-3.8-flash', thinking: 'low' },
-  { id: 'gemini-3.6-flash', thinking: 'minimal' },
-  { id: 'gemini-3.5-flash-lite', thinking: 'minimal' },
-  { id: 'gemini-3.7-flash', thinking: 'low' },
   { id: 'gemini-3.5-flash', thinking: 'low' },
+  { id: 'gemini-3.8-flash', thinking: 'low' },
+  { id: 'gemini-3.6-flash', thinking: 'low' },
   { id: 'gemini-flash-latest', thinking: 'low' },
+  { id: 'gemini-3.7-flash', thinking: 'low' },
+  { id: 'gemini-3.5-flash-lite', thinking: 'minimal' },
 ];
 
 export type ErrorKind =
@@ -198,9 +201,18 @@ export interface CallResult<T> {
   data: T;
   model: string;
   ms: number;
+  /** Set when no model passed validation and this is the best attempt we got. */
+  invalid?: string;
+  /** With `invalid`: the most telling reason the other models failed (e.g. quota). */
+  failure?: ErrorKind;
 }
 
-export async function callGemini<T = any>(opts: {
+/** Turns an unusable fallback answer into the error the person should see. */
+export function failureOf(result: CallResult<unknown>) {
+  return new GeminiError(result.failure === 'quota' || result.failure === 'busy' ? result.failure : 'format', 0, result.invalid || '');
+}
+
+export interface CallOptions<T> {
   key: string;
   system: string;
   parts: Part[];
@@ -210,132 +222,171 @@ export async function callGemini<T = any>(opts: {
   temperature?: number;
   signal?: AbortSignal;
   budgetMs?: number;
+  /** Start the same request on the next model if the current one is this slow (0 = never). */
+  hedgeMs?: number;
+  /** Return a reason string when the answer is unusable (e.g. written in the wrong language). */
+  validate?: (data: T) => string | null;
   models?: ModelSpec[];
   onModel?: (model: string) => void;
   fetchImpl?: typeof fetch;
-}): Promise<CallResult<T>> {
-  const key = opts.key.trim();
-  if (!key) throw new GeminiError('nokey');
-  const doFetch = opts.fetchImpl || (import.meta.env.DEV && key === 'mock' ? mockFetch : fetch.bind(globalThis));
-  const timeoutMs = opts.timeoutMs ?? 25000;
-  // Never keep someone waiting for minutes while every model times out in turn.
-  const deadline = Date.now() + (opts.budgetMs ?? Math.max(45000, timeoutMs * 1.6));
-  const errors: GeminiError[] = [];
-  const models = opts.models || orderedModels();
+}
 
-  for (const spec of models) {
-    if (Date.now() > deadline - 3000) break;
-    let lite = !!readHealth()[spec.id]?.lite;
-    let maxTokens = opts.maxTokens ?? 4096;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (opts.signal?.aborted) throw new GeminiError('aborted');
-      opts.onModel?.(spec.id);
-      const controller = new AbortController();
-      const onOuterAbort = () => controller.abort();
-      opts.signal?.addEventListener('abort', onOuterAbort);
-      const timer = setTimeout(() => controller.abort(), Math.max(3000, Math.min(timeoutMs, deadline - Date.now())));
-      const started = Date.now();
-      try {
-        const response = await doFetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${spec.id}:generateContent`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-            body: JSON.stringify(
-              buildBody({
-                system: opts.system,
-                parts: opts.parts,
-                schema: opts.schema,
-                spec,
-                lite,
-                maxTokens,
-                temperature: opts.temperature ?? 0.4,
-              }),
-            ),
-            signal: controller.signal,
-          },
-        );
-        const ms = Date.now() - started;
-        if (!response.ok) {
-          let message = '';
-          try {
-            const body = await response.json();
-            message = String(body?.error?.message || body?.error?.status || '');
-          } catch {
-            /* non-JSON error body */
-          }
-          const { kind, action } = classify(response.status, message);
-          record(spec.id, `${response.status} ${message.slice(0, 90)}`, ms);
-          const error = new GeminiError(kind, response.status, message.slice(0, 160));
-          if (action === 'stop') throw error;
-          if (action === 'lite' && !lite) {
-            lite = true;
-            note(spec.id, { lite: true });
-            continue;
-          }
-          errors.push(error);
-          const hardQuota = response.status === 429 && /limit:\s*0\b|free.?tier.*0/i.test(message);
-          const cool =
-            response.status === 404 || response.status === 403 || hardQuota
-              ? 6 * 3600e3
-              : response.status === 429
-                ? 60e3
-                : 30e3;
-          note(spec.id, { skipUntil: Date.now() + cool, reason: String(response.status) });
-          break;
-        }
-        const raw = await response.json();
-        const { text, finish, blocked } = answerText(raw);
-        if (blocked || finish === 'SAFETY' || finish === 'PROHIBITED_CONTENT') {
-          record(spec.id, `blocked ${blocked || finish}`, ms);
-          throw new GeminiError('blocked', 200, blocked || finish);
-        }
-        if (!text) {
-          record(spec.id, `empty ${finish}`, ms);
-          if (finish === 'MAX_TOKENS' && attempt === 0) {
-            maxTokens *= 2;
-            continue;
-          }
-          errors.push(new GeminiError('format', 200, `empty ${finish}`));
-          break;
-        }
-        let data: T;
+type Outcome<T> = { ok: CallResult<T> } | { error: GeminiError; stop?: boolean; invalid?: CallResult<T> };
+
+/** One model, including its own retries (plain request if new fields are rejected, bigger budget if cut off). */
+async function runModel<T>(spec: ModelSpec, opts: CallOptions<T>, key: string, doFetch: typeof fetch, signal: AbortSignal, timeoutMs: number): Promise<Outcome<T>> {
+  let lite = !!readHealth()[spec.id]?.lite;
+  let maxTokens = opts.maxTokens ?? 4096;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (signal.aborted) return { error: new GeminiError('aborted') };
+    opts.onModel?.(spec.id);
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal.addEventListener('abort', onAbort);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    const started = Date.now();
+    try {
+      const response = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${spec.id}:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(
+          buildBody({ system: opts.system, parts: opts.parts, schema: opts.schema, spec, lite, maxTokens, temperature: opts.temperature ?? 0.4 }),
+        ),
+        signal: controller.signal,
+      });
+      const ms = Date.now() - started;
+      if (!response.ok) {
+        let message = '';
         try {
-          data = parseJsonLoose(text);
+          const body = await response.json();
+          message = String(body?.error?.message || body?.error?.status || '');
         } catch {
-          record(spec.id, `bad json ${finish}`, ms);
-          if (finish === 'MAX_TOKENS' && attempt === 0) {
-            maxTokens *= 2;
-            continue;
-          }
-          errors.push(new GeminiError('format', 200, `bad json ${finish}`));
-          break;
+          /* non-JSON error body */
         }
-        record(spec.id, 'ok', ms);
-        note(spec.id, { okAt: Date.now(), ms, skipUntil: 0, reason: '' });
-        return { data, model: spec.id, ms };
-      } catch (caught) {
-        if (caught instanceof GeminiError) throw caught;
-        const ms = Date.now() - started;
-        if (opts.signal?.aborted) throw new GeminiError('aborted');
-        if (caught instanceof DOMException && caught.name === 'AbortError') {
-          record(spec.id, 'timeout', ms);
-          errors.push(new GeminiError('timeout'));
-          note(spec.id, { skipUntil: Date.now() + 20e3, reason: 'timeout' });
-          break;
+        const { kind, action } = classify(response.status, message);
+        record(spec.id, `${response.status} ${message.slice(0, 90)}`, ms);
+        const error = new GeminiError(kind, response.status, message.slice(0, 160));
+        if (action === 'stop') return { error, stop: true };
+        if (action === 'lite' && !lite) {
+          lite = true;
+          note(spec.id, { lite: true });
+          continue;
         }
-        record(spec.id, `network ${(caught as Error)?.message || ''}`.slice(0, 90), ms);
-        if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new GeminiError('network');
-        errors.push(new GeminiError('network'));
-        break;
-      } finally {
-        clearTimeout(timer);
-        opts.signal?.removeEventListener('abort', onOuterAbort);
+        const hardQuota = response.status === 429 && /limit:\s*0\b|free.?tier.*0/i.test(message);
+        const cool = response.status === 404 || response.status === 403 || hardQuota ? 6 * 3600e3 : response.status === 429 ? 60e3 : 30e3;
+        note(spec.id, { skipUntil: Date.now() + cool, reason: String(response.status) });
+        return { error };
       }
+      const raw = await response.json();
+      const { text, finish, blocked } = answerText(raw);
+      if (blocked || finish === 'SAFETY' || finish === 'PROHIBITED_CONTENT') {
+        record(spec.id, `blocked ${blocked || finish}`, ms);
+        return { error: new GeminiError('blocked', 200, blocked || finish), stop: true };
+      }
+      let data: T;
+      try {
+        if (!text) throw new SyntaxError('empty');
+        data = parseJsonLoose(text);
+      } catch {
+        record(spec.id, `${text ? 'bad json' : 'empty'} ${finish}`, ms);
+        if (finish === 'MAX_TOKENS' && attempt === 0) {
+          maxTokens *= 2;
+          continue;
+        }
+        return { error: new GeminiError('format', 200, `${text ? 'bad json' : 'empty'} ${finish}`) };
+      }
+      const invalid = opts.validate?.(data) || null;
+      if (invalid) {
+        record(spec.id, `invalid ${invalid}`, ms);
+        return { error: new GeminiError('format', 200, `invalid ${invalid}`), invalid: { data, model: spec.id, ms, invalid } };
+      }
+      record(spec.id, 'ok', ms);
+      note(spec.id, { okAt: Date.now(), ms, skipUntil: 0, reason: '' });
+      return { ok: { data, model: spec.id, ms } };
+    } catch (caught) {
+      const ms = Date.now() - started;
+      if (signal.aborted && !timedOut) return { error: new GeminiError('aborted') };
+      if (timedOut || (caught instanceof DOMException && caught.name === 'AbortError')) {
+        record(spec.id, 'timeout', ms);
+        note(spec.id, { skipUntil: Date.now() + 20e3, reason: 'timeout' });
+        return { error: new GeminiError('timeout') };
+      }
+      record(spec.id, `network ${(caught as Error)?.message || ''}`.slice(0, 90), ms);
+      const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      return { error: new GeminiError('network'), stop: offline };
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
     }
   }
-  errors.sort((a, b) => PRIORITY.indexOf(a.kind) - PRIORITY.indexOf(b.kind));
-  throw errors[0] || new GeminiError('model');
+  return { error: new GeminiError('format', 200, 'retries exhausted') };
+}
+
+/**
+ * Tries models in order. A failure moves straight on; a slow model gets company: after hedgeMs the
+ * next model starts in parallel and the first usable answer wins (the rest are cancelled).
+ */
+export function callGemini<T = any>(opts: CallOptions<T>): Promise<CallResult<T>> {
+  const key = opts.key.trim();
+  if (!key) return Promise.reject(new GeminiError('nokey'));
+  const doFetch = opts.fetchImpl || (import.meta.env.DEV && key === 'mock' ? mockFetch : fetch.bind(globalThis));
+  const timeoutMs = opts.timeoutMs ?? 25000;
+  const deadline = Date.now() + (opts.budgetMs ?? Math.max(45000, timeoutMs * 1.6));
+  const hedgeMs = opts.hedgeMs ?? 0;
+  const queue = [...(opts.models || orderedModels())];
+  const errors: GeminiError[] = [];
+  let fallback: CallResult<T> | null = null;
+  const running = new Set<AbortController>();
+  let settled = false;
+
+  return new Promise<CallResult<T>>((resolve, reject) => {
+    const finish = (result: CallResult<T> | null, error?: GeminiError) => {
+      if (settled) return;
+      settled = true;
+      running.forEach((c) => c.abort());
+      opts.signal?.removeEventListener('abort', onOuterAbort);
+      if (result) resolve(result);
+      else reject(error);
+    };
+    const giveUp = () => {
+      errors.sort((a, b) => PRIORITY.indexOf(a.kind) - PRIORITY.indexOf(b.kind));
+      if (fallback) return finish({ ...fallback, failure: errors[0]?.kind });
+      finish(null, errors[0] || new GeminiError('model'));
+    };
+    const onOuterAbort = () => finish(null, new GeminiError('aborted'));
+    if (opts.signal?.aborted) return onOuterAbort();
+    opts.signal?.addEventListener('abort', onOuterAbort);
+
+    const launch = () => {
+      if (settled) return;
+      const remaining = deadline - Date.now();
+      const spec = queue.shift();
+      if (!spec || remaining < 3000) {
+        if (!running.size) giveUp();
+        return;
+      }
+      const controller = new AbortController();
+      running.add(controller);
+      const hedge = hedgeMs > 0 ? setTimeout(() => running.has(controller) && running.size < 2 && launch(), hedgeMs) : 0;
+      void runModel(spec, opts, key, doFetch, controller.signal, Math.max(3000, Math.min(timeoutMs, remaining))).then((outcome) => {
+        clearTimeout(hedge);
+        running.delete(controller);
+        if (settled) return;
+        if ('ok' in outcome) return finish(outcome.ok);
+        if (outcome.error.kind === 'aborted') return;
+        if (outcome.stop) return finish(null, outcome.error);
+        errors.push(outcome.error);
+        if (outcome.invalid) fallback ??= outcome.invalid;
+        if (running.size === 0 || queue.length) launch();
+        if (!running.size && !queue.length) giveUp();
+      });
+    };
+    launch();
+  });
 }
 
 /** Lightweight probe used by the "connection test" button and onboarding. */

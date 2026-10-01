@@ -1,11 +1,13 @@
 import { useMemo, useState } from 'react';
-import { blobToBase64, callGemini, GeminiError, type Part } from '../lib/gemini';
+import { blobToBase64, callGemini, failureOf, GeminiError, type Part } from '../lib/gemini';
 import {
   systemPrompt,
   turnFromUnderstand,
   turnFromWrite,
   understandPrompt,
   UNDERSTAND_SCHEMA,
+  validateUnderstand,
+  validateWrite,
   writePrompt,
   WRITE_SCHEMA,
   type UnderstandJson,
@@ -57,8 +59,11 @@ export function MessageView() {
         system: systemPrompt(app.profile, app.glossary),
         parts: [{ text: understandPrompt({ profile: app.profile, turns: app.turns, text }) }],
         schema: UNDERSTAND_SCHEMA,
+        validate: (data) => validateUnderstand(data, app.profile),
+        hedgeMs: 8000,
       });
-      const turn = turnFromUnderstand(result.data, text, { model: result.model, ms: result.ms, id: uid(), ts: Date.now() });
+      if (result.invalid === 'translation') throw failureOf(result);
+      const turn = turnFromUnderstand(result.data, text, { model: result.model, ms: result.ms, id: uid(), ts: Date.now(), myLang: my });
       app.setTurns((prev) => [...prev, turn]);
       setLastIn(turn.id);
       setInText('');
@@ -93,9 +98,12 @@ export function MessageView() {
         system: systemPrompt(app.profile, app.glossary),
         parts,
         schema: WRITE_SCHEMA,
+        validate: (data) => validateWrite(data, app.profile),
         timeoutMs: audio ? 30000 : 25000,
+        hedgeMs: audio ? 10000 : 8000,
       });
       const turn = turnFromWrite(result.data, { profile: app.profile, input: audio ? 'voice' : 'text', model: result.model, ms: result.ms, id: uid(), ts: Date.now() });
+      if (!turn.lines?.length) throw failureOf(result);
       app.setTurns((prev) => [...prev, turn]);
       setLastOut(turn.id);
       if (audio) setOutText(textIn(turn, my));

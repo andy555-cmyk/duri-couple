@@ -45,6 +45,7 @@ src/components/*      화면
 tests/*.test.ts       32개 (모델 대체·오류 분류·잘림 재시도·매핑·공유 링크·복습)
 tools/publish.sh      테스트 → 빌드 → gh-pages 강제 푸시
 tools/live-check.mjs  실제 Gemini 점검(맥 키체인 열쇠, 말소리 m4a 자동 생성)
+tools/compare-models.mjs  모델별 단독 비교(정확도·속도) — 모델 순서 정할 때
 ```
 
 저장 키(기기 안): `duri.profile` `duri.settings`(열쇠 포함) `duri.turns` `duri.phrases` `duri.glossary` `duri.daily` `duri.models`(모델 건강) · 세션: `duri.tab` `duri.msg.*`
@@ -75,13 +76,15 @@ security add-generic-password -a duri -s duri-gemini-key -U -w
 - 운영 빌드에 mock 코드 없음
 - 2026-10-02 02:2x 배포 완료: https://andy555-cmyk.github.io/duri-couple/ 200, JS·CSS·manifest·아이콘·og 전부 200, 콘솔 오류 0 (저장소는 대표가 github.com/new 로 생성 — 저장된 토큰은 새 저장소 생성 권한 없음, gh-pages 푸시로 Pages 자동 활성)
 
-확인 필요 (대표 행동 필요)
-- **실제 Gemini 응답**: 열쇠가 키체인에 없어 아직 못 돌림 → `node tools/live-check.mjs`
+- **실제 Gemini 실측 (2026-10-02 02:30~02:50, 키체인 열쇠)**: 문자 한→일·일→한, 음성(아이폰과 같은 AAC/MP4, macOS say로 생성) 한·일, 받은 메시지 풀기, 보낼 메시지, 발음 체크, 오늘의 한마디 8종 모두 성공. gemini-3.5-flash 기준 1.8~4.3초
+- 모델별 단독 비교(`tools/compare-models.mjs`): 3.5-flash만 가용·정확 모두 통과. 3.8/3.7/latest는 무료 등급에서 503 잦음, 3.6(minimal)·3.5-flash-lite는 답장을 한국어로 쓰거나 한글 발음 자리에 가타카나를 씀 → 순서 3.5-flash → 3.8 → 3.6(low) → latest → 3.7 → lite
+- 그래서 추가한 것: ① 글자 검사(일본어 칸에 가나·한자, 발음 칸에 가타카나/한글만) 실패 시 다음 모델 ② 후리가나 `今日(きょう)` 제거 ③ 느릴 때 병렬 요청(문자 7초·음성 10초 후 다음 모델 동시 시작, 먼저 온 정답 채택) — 실측 27초 꼬리 지연 대응 ④ 전부 실패면 가장 나은 답을 정리해서 보여주되 번역 자체가 틀리면 오류
+- 무료 등급 분당 한도: 15분에 약 40회 호출하자 모든 모델 429 → 1분 뒤 회복. 앱은 "1분 뒤 다시"를 띄우고 녹음은 보관(다시 시도). 실사용에서 자주 걸리면 구글 결제 연결로 한도 상향(요금은 확인 필요)
 - 아이폰 실기: 마이크 권한·녹음(audio/mp4)·레벨미터·자동 읽기 음량(녹음 직후 수화기로 작게 나오는지)·홈 화면 앱
 
 ## 7. 다음 작업 후보 (우선순위)
 
-1. 실호출 점검 → 프롬프트 미세 조정(발음 표기 품질: 장음 ー, 받침 작은 가타카나)
+1. 실사용 기록으로 프롬프트 미세 조정(발음 표기, 3번째 메시지 안에서 '終電' 같은 단어 오류 1건 관찰)
 2. 아이폰 실기 점검 후 iOS 특이점 수정
 3. 두 폰 동기화(로그인·커플 연결) — 서버 필요. 후보: Cloudflare Workers + D1(대표 Cloudflare 로그인 필요). 그때 열쇠도 서버로 옮김
 4. 사진 추억 카드(IndexedDB), 기념일 알림
