@@ -1,7 +1,7 @@
 # 둘의 말 (ふたりの言葉) — 인수인계서 v2
 
 작성: 2026-10-02 · 클로드(Opus 5.5)
-정본 위치: `~/dev/duri-couple` (git) · 공개 주소(예정): https://andy555-cmyk.github.io/duri-couple/
+정본 위치: `~/dev/duri-couple` (git, GitHub andy555-cmyk/duri-couple · main=소스, gh-pages=배포본) · 공개 주소: https://andy555-cmyk.github.io/duri-couple/
 이전 판(v1, Next/OpenAI Sites, 비공개): `~/Documents/ChatGPT/Personal/duri-couple` — 더 이상 고치지 않음.
 
 ## 1. 한 문장
@@ -73,10 +73,10 @@ security add-generic-password -a duri -s duri-gemini-key -U -w
 - 타입 검사·빌드 통과, 단위 테스트 32/32
 - 브라우저(모바일 375×812, 라이트/다크)에서 가짜 응답으로: 온보딩 → 대화(한→일, 일→한) → 추천 표현 교체 → 마주보기 → 받은 메시지 풀기 → 답장 쓰기 → 오늘의 한마디 → 저장 → 복습 → 우리 탭 → 일본어 화면 전환 → 초대 링크로 두 번째 폰 시작(일본어·이름·날짜·사전 자동 입력) 전부 동작, 콘솔 오류 0
 - 운영 빌드에 mock 코드 없음
+- 2026-10-02 02:2x 배포 완료: https://andy555-cmyk.github.io/duri-couple/ 200, JS·CSS·manifest·아이콘·og 전부 200, 콘솔 오류 0 (저장소는 대표가 github.com/new 로 생성 — 저장된 토큰은 새 저장소 생성 권한 없음, gh-pages 푸시로 Pages 자동 활성)
 
 확인 필요 (대표 행동 필요)
 - **실제 Gemini 응답**: 열쇠가 키체인에 없어 아직 못 돌림 → `node tools/live-check.mjs`
-- **GitHub 저장소**: 저장된 토큰(세분화 토큰, 8개 저장소 한정)으로는 새 저장소 생성 불가(403) → 대표가 github.com/new 에서 `duri-couple` 공개 빈 저장소 생성 → `sh tools/publish.sh`
 - 아이폰 실기: 마이크 권한·녹음(audio/mp4)·레벨미터·자동 읽기 음량(녹음 직후 수화기로 작게 나오는지)·홈 화면 앱
 
 ## 7. 다음 작업 후보 (우선순위)
