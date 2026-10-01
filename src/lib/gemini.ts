@@ -24,6 +24,7 @@ export const MODELS: ModelSpec[] = [
   { id: 'gemini-3.5-flash-lite', thinking: 'minimal' },
   { id: 'gemini-3.7-flash', thinking: 'low' },
   { id: 'gemini-3.5-flash', thinking: 'low' },
+  { id: 'gemini-flash-latest', thinking: 'low' },
 ];
 
 export type ErrorKind =
@@ -208,6 +209,7 @@ export async function callGemini<T = any>(opts: {
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
+  budgetMs?: number;
   models?: ModelSpec[];
   onModel?: (model: string) => void;
   fetchImpl?: typeof fetch;
@@ -216,10 +218,13 @@ export async function callGemini<T = any>(opts: {
   if (!key) throw new GeminiError('nokey');
   const doFetch = opts.fetchImpl || (import.meta.env.DEV && key === 'mock' ? mockFetch : fetch.bind(globalThis));
   const timeoutMs = opts.timeoutMs ?? 25000;
+  // Never keep someone waiting for minutes while every model times out in turn.
+  const deadline = Date.now() + (opts.budgetMs ?? Math.max(45000, timeoutMs * 1.6));
   const errors: GeminiError[] = [];
   const models = opts.models || orderedModels();
 
   for (const spec of models) {
+    if (Date.now() > deadline - 3000) break;
     let lite = !!readHealth()[spec.id]?.lite;
     let maxTokens = opts.maxTokens ?? 4096;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -228,7 +233,7 @@ export async function callGemini<T = any>(opts: {
       const controller = new AbortController();
       const onOuterAbort = () => controller.abort();
       opts.signal?.addEventListener('abort', onOuterAbort);
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const timer = setTimeout(() => controller.abort(), Math.max(3000, Math.min(timeoutMs, deadline - Date.now())));
       const started = Date.now();
       try {
         const response = await doFetch(

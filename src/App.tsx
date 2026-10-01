@@ -66,7 +66,7 @@ function Shell() {
     if (app.keyRequest) setKeyOpen(true);
   }, [app.keyRequest]);
 
-  if (!settings.onboarded) return <Onboarding invitedBy={invite?.fromName || undefined} />;
+  if (!settings.onboarded) return <Onboarding key={invite ? 'invite' : 'plain'} invitedBy={invite?.fromName || undefined} />;
 
   const days = daysTogether(app.profile.startDate);
   return (

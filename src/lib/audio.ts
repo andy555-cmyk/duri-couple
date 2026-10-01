@@ -49,11 +49,14 @@ export class Recorder {
 
   async start(maxMs = 60000) {
     if (!micSupported()) throw new Error('unsupported' satisfies MicError);
+    // iOS only lets an AudioContext run if it is created inside the tap, i.e. before the first await.
+    this.createContext();
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
     } catch {
+      this.cleanup();
       throw new Error('denied' satisfies MicError);
     }
     const mime = pickMime();
@@ -96,12 +99,20 @@ export class Recorder {
     void this.stop();
   }
 
-  private meter() {
-    if (!this.onLevel || !this.stream) return;
+  private createContext() {
+    if (!this.onLevel) return;
     try {
       const AC: typeof AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AC) return;
-      this.ctx = new AC();
+      if (AC) this.ctx = new AC();
+      void this.ctx?.resume().catch(() => {});
+    } catch {
+      this.ctx = undefined;
+    }
+  }
+
+  private meter() {
+    if (!this.onLevel || !this.stream || !this.ctx) return;
+    try {
       const source = this.ctx.createMediaStreamSource(this.stream);
       const analyser = this.ctx.createAnalyser();
       analyser.fftSize = 512;
