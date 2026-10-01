@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="112" fill="#f7f3eb"/>
+  <rect width="512" height="512" rx="0" fill="#f7f3eb"/>
   <path d="M206 96c-74 0-134 56-134 126 0 33 13 63 35 85l-17 62 63-30c16 6 34 9 53 9 74 0 134-56 134-126S280 96 206 96Z" fill="#233d35"/>
   <path d="M310 168c74 0 134 56 134 126 0 33-13 63-35 85l17 62-63-30c-16 6-34 9-53 9-74 0-134-56-134-126s60-126 134-126Z" fill="#ff735f" stroke="#f7f3eb" stroke-width="14"/>
   <text x="170" y="212" font-family="Apple SD Gothic Neo, sans-serif" font-weight="800" font-size="96" fill="#f7f3eb" text-anchor="middle">말</text>
