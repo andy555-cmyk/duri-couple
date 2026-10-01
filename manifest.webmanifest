@@ -1,0 +1,17 @@
+{
+  "name": "둘의 말 · ふたりの言葉",
+  "short_name": "둘의 말",
+  "description": "한일 커플을 위한 통역·학습·기록 앱",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f7f3eb",
+  "theme_color": "#f7f3eb",
+  "lang": "ko",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
