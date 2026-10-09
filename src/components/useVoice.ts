@@ -3,10 +3,12 @@ import { Recorder, type Recording } from '../lib/audio';
 import { stopSpeaking, unlockSpeech } from '../lib/speech';
 
 /**
- * Tap-to-start / tap-to-stop recording with a live level meter.
- * The level is written straight into a CSS variable so 60 fps updates never re-render React.
+ * Tap to start; it stops by itself when the speaker goes quiet (autoEnd), or on a second tap.
+ * The level is written straight into a CSS variable so frequent updates never re-render React.
  */
-export function useVoice(onDone: (recording: Recording) => void, onError: (error: Error) => void) {
+export function useVoice(onDone: (recording: Recording) => void, onError: (error: Error) => void, opts: { autoEnd?: boolean } = {}) {
+  const autoEnd = useRef(opts.autoEnd);
+  autoEnd.current = opts.autoEnd;
   const [recording, setRecording] = useState(false);
   const [startedAt, setStartedAt] = useState(0);
   const recorder = useRef<Recorder | null>(null);
@@ -27,6 +29,10 @@ export function useVoice(onDone: (recording: Recording) => void, onError: (error
     const result = await active.stop();
     setRecording(false);
     if (!result) return;
+    if (active.stoppedForSilence) {
+      fail.current(new Error('silence'));
+      return;
+    }
     if (result.blob.size < 1200 || result.ms < 500) {
       fail.current(new Error('short'));
       return;
@@ -38,10 +44,15 @@ export function useVoice(onDone: (recording: Recording) => void, onError: (error
     unlockSpeech();
     stopSpeaking();
     if (recorder.current) return;
-    const next = new Recorder(setLevel, () => void stop());
+    const next = new Recorder({ onLevel: setLevel, onAutoStop: () => void stop(), autoEnd: !!autoEnd.current });
     recorder.current = next;
     try {
-      await next.start();
+      const started = await next.start();
+      // Cancelled or stopped while the permission prompt was up.
+      if (!started || recorder.current !== next) {
+        next.cancel();
+        return;
+      }
       setStartedAt(Date.now());
       setRecording(true);
     } catch (error) {
@@ -58,7 +69,19 @@ export function useVoice(onDone: (recording: Recording) => void, onError: (error
 
   const toggle = useCallback(() => (recorder.current ? stop() : start()), [start, stop]);
 
-  useEffect(() => () => recorder.current?.cancel(), []);
+  useEffect(() => {
+    // Leaving the screen or the app always releases the microphone.
+    const release = () => {
+      recorder.current?.cancel();
+      recorder.current = null;
+      setRecording(false);
+    };
+    window.addEventListener('pagehide', release);
+    return () => {
+      window.removeEventListener('pagehide', release);
+      recorder.current?.cancel();
+    };
+  }, []);
 
   return { recording, startedAt, start, stop, cancel, toggle, levelEl };
 }

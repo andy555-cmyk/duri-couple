@@ -39,6 +39,29 @@ export function useApp() {
   return value;
 }
 
+const toastBus: { show?: (text: string) => void } = {};
+
+function ToastHost() {
+  const [text, setText] = useState('');
+  const timer = useRef(0);
+  useEffect(() => {
+    toastBus.show = (next) => {
+      setText(next);
+      clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setText(''), 2400);
+    };
+    return () => {
+      toastBus.show = undefined;
+      clearTimeout(timer.current);
+    };
+  }, []);
+  return (
+    <div className={`toast ${text ? 'show' : ''}`} role="status" aria-live="polite">
+      {text}
+    </div>
+  );
+}
+
 export function AppProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = usePersistent<Profile>(KEYS.profile, DEFAULT_PROFILE);
   const [settings, setSettings] = usePersistent<Settings>(KEYS.settings, DEFAULT_SETTINGS);
@@ -46,9 +69,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [phrases, setPhrases] = usePersistent<Phrase[]>(KEYS.phrases, []);
   const [glossary, setGlossary] = usePersistent<GlossaryItem[]>(KEYS.glossary, []);
   const [daily, setDaily] = usePersistent<Daily | null>(KEYS.daily, null);
-  const [toastText, setToastText] = useState('');
   const [keyRequest, setKeyRequest] = useState(0);
-  const toastTimer = useRef(0);
   const [storageOk, setStorageOk] = useState(true);
 
   const t = useMemo(() => makeT(profile.myLang), [profile.myLang]);
@@ -61,11 +82,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     document.title = t('appName');
   }, [my, t]);
 
-  const toast = useCallback((text: string) => {
-    setToastText(text);
-    clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToastText(''), 2400);
-  }, []);
+  // The toast lives in its own small component, so showing one does not redraw every screen (Codex review S4).
+  const toast = useCallback((text: string) => toastBus.show?.(text), []);
+  const openKey = useCallback(() => setKeyRequest((n) => n + 1), []);
 
   const isKept = useCallback(
     (src: { ko: string; ja: string }) => phrases.some((p) => p.ko.trim() === src.ko.trim() && p.ja.trim() === src.ja.trim()),
@@ -86,6 +105,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const errorText = useCallback(
     (error: unknown) => {
       const kind = error instanceof GeminiError ? error.kind : (error as Error)?.message || '';
+      // A home-screen app has no address bar, so the fix is in iOS Settings instead.
+      const standalone = matchMedia('(display-mode: standalone)').matches || !!(navigator as any).standalone;
+      if (kind === 'denied' && standalone) return t('err.micApp');
       const key = errorKey(kind);
       if (key) return t(key);
       if (error instanceof GeminiError) return t('err.request', { detail: `${error.status || ''} ${error.detail}`.trim().slice(0, 80) });
@@ -94,39 +116,42 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [t],
   );
 
-  const value: AppState = {
-    t,
-    my,
-    their,
-    profile,
-    setProfile,
-    settings,
-    setSettings,
-    turns,
-    setTurns,
-    phrases,
-    setPhrases,
-    glossary,
-    setGlossary,
-    daily,
-    setDaily,
-    toast,
-    keepPhrase,
-    isKept,
-    errorText,
-    openKey: () => setKeyRequest((n) => n + 1),
-    keyRequest,
-    partnerName: profile.partnerName.trim() || t('partner'),
-    myName: profile.myName.trim() || t('me'),
-  };
+  const partnerName = profile.partnerName.trim() || t('partner');
+  const myName = profile.myName.trim() || t('me');
+  const value = useMemo<AppState>(
+    () => ({
+      t,
+      my,
+      their,
+      profile,
+      setProfile,
+      settings,
+      setSettings,
+      turns,
+      setTurns,
+      phrases,
+      setPhrases,
+      glossary,
+      setGlossary,
+      daily,
+      setDaily,
+      toast,
+      keepPhrase,
+      isKept,
+      errorText,
+      openKey,
+      keyRequest,
+      partnerName,
+      myName,
+    }),
+    [t, my, their, profile, setProfile, settings, setSettings, turns, setTurns, phrases, setPhrases, glossary, setGlossary, daily, setDaily, toast, keepPhrase, isKept, errorText, openKey, keyRequest, partnerName, myName],
+  );
 
   return (
     <Ctx.Provider value={value}>
       {children}
       {!storageOk && <div className="storage-warning">{t('err.storage')}</div>}
-      <div className={`toast ${toastText ? 'show' : ''}`} role="status" aria-live="polite">
-        {toastText}
-      </div>
+      <ToastHost />
     </Ctx.Provider>
   );
 }

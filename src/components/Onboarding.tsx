@@ -4,7 +4,7 @@ import { makeT } from '../lib/i18n';
 import type { Lang, Profile } from '../lib/types';
 import { useApp } from './AppContext';
 import { Icon } from './Icon';
-import { ProfileFields } from './UsView';
+import { ProfileFields } from './ProfileFields';
 
 const STUDIO_URL = 'https://aistudio.google.com/apikey';
 

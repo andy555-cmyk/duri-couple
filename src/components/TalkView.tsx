@@ -1,11 +1,14 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
-import { errorKey, makeT } from '../lib/i18n';
+import { errorKey, makeT, type TKey } from '../lib/i18n';
+import { liveSupported } from '../lib/live';
+import { looksLike } from '../lib/prompts';
 import { speak } from '../lib/speech';
-import { dateKey } from '../lib/store';
+import { dateKey, useSession } from '../lib/store';
 import type { Lang, Tone, Turn } from '../lib/types';
 import { useApp } from './AppContext';
 import { Icon } from './Icon';
 import { readingOf, textIn, translated, TurnCard } from './TurnCard';
+import { useLive, type Live } from './useLive';
 import { useTalk, type Talk } from './useTalk';
 import { useElapsed } from './useVoice';
 
@@ -112,21 +115,44 @@ export function TalkView({ face, onCloseFace }: { face: boolean; onCloseFace: ()
           </div>
         )}
       </div>
+      <p className="sr-only" aria-live="polite">
+        {talkTurns.length ? translated(talkTurns[talkTurns.length - 1]).text : ''}
+      </p>
       <Composer talk={talk} />
       {face && <FaceToFace talk={talk} turns={talkTurns} onClose={onCloseFace} />}
     </div>
   );
 }
 
+/** Fills in while the answer streams: what was heard on top, the translation typing below. */
 function PendingCard({ talk }: { talk: Talk }) {
-  const { t } = useApp();
+  const { t, my } = useApp();
   const seconds = useElapsed(talk.working, talk.workingSince);
+  const live = talk.live;
+  const source = live?.said || talk.pendingText;
+  const mine = live?.lang ? live.lang === my : !!talk.pendingText;
+  const status = live?.translation ? (live.translationDone ? t('talk.polishing') : t('talk.translating')) : source ? t('talk.translating') : t('talk.hearing');
   return (
-    <div className={`pending ${talk.pendingText ? 'mine' : ''}`}>
-      {talk.pendingText && <p className="pending-text">{talk.pendingText}</p>}
+    <div className={`pending ${mine ? 'mine' : 'theirs'} ${live?.translation ? 'streaming' : ''}`} aria-live="off">
+      {source && (
+        <p className="pending-text" lang={live?.lang}>
+          {source}
+        </p>
+      )}
+      {live?.translation ? (
+        <p className="live-translation" lang={live.lang === 'ko' ? 'ja' : live.lang === 'ja' ? 'ko' : undefined}>
+          {live.translation}
+          {!live.translationDone && <span className="caret" aria-hidden="true" />}
+        </p>
+      ) : (
+        <>
+          <div className="skeleton" />
+          <div className="skeleton short" />
+        </>
+      )}
       <div className="pending-row">
         <span className="spinner" />
-        <span>{t('talk.work')}</span>
+        <span>{status}</span>
         <span className="muted">
           {seconds}s{talk.model ? ` · ${talk.model.replace('gemini-', '')}` : ''}
         </span>
@@ -136,8 +162,6 @@ function PendingCard({ talk }: { talk: Talk }) {
           </button>
         )}
       </div>
-      <div className="skeleton" />
-      <div className="skeleton short" />
     </div>
   );
 }
@@ -247,7 +271,8 @@ export function MicButton({
   const t = lang ? makeT(lang) : app.t;
   const phase = talk.phase;
   const seconds = useElapsed(phase === 'recording', talk.voice.startedAt);
-  const text = label || { idle: t('talk.mic'), rec: t('talk.rec'), work: t('talk.work') };
+  const auto = app.settings.autoSend;
+  const text = label || { idle: t('talk.mic'), rec: auto ? t('talk.recAuto') : t('talk.rec'), work: t('talk.work') };
   return (
     <button
       ref={(el) => {
@@ -274,7 +299,7 @@ export function MicButton({
       </span>
       <span className="mic-text">
         <b>{phase === 'recording' ? text.rec : phase === 'working' ? text.work : text.idle}</b>
-        <small>{phase === 'recording' ? t('talk.recSub', { s: seconds }) : phase === 'working' ? '' : sub ?? t('talk.micSub')}</small>
+        <small>{phase === 'recording' ? t(auto ? 'talk.recAutoSub' : 'talk.recSub', { s: seconds }) : phase === 'working' ? '' : sub ?? t('talk.micSub')}</small>
       </span>
     </button>
   );
@@ -282,18 +307,53 @@ export function MicButton({
 
 function FaceToFace({ talk, turns, onClose }: { talk: Talk; turns: Turn[]; onClose: () => void }) {
   const app = useApp();
+  const [mode, setMode] = useSession<'live' | 'tap'>('duri.face.mode', liveSupported() ? 'live' : 'tap');
+  const live = useLive();
   const last = turns[turns.length - 1];
   const out = last ? translated(last) : null;
+  const switchMode = (next: 'live' | 'tap') => {
+    if (next === mode) return;
+    if (next === 'tap') live.stop();
+    setMode(next);
+  };
   return (
-    <div className="face" role="dialog" aria-modal="true">
-      <FaceHalf lang={app.their} talk={talk} last={last} flipped />
+    <div className={`face ${mode}`} role="dialog" aria-modal="true">
+      {mode === 'live' ? <LiveHalf lang={app.their} live={live} flipped /> : <FaceHalf lang={app.their} talk={talk} last={last} flipped />}
       <div className="face-divider">
-        <button className="round-button" onClick={onClose} aria-label={app.t('close')}>
+        <button
+          className="round-button"
+          onClick={() => {
+            live.stop();
+            onClose();
+          }}
+          aria-label={app.t('close')}
+        >
           <Icon name="close" />
         </button>
-        <button className="round-button" disabled={!out} onClick={() => out && speak(out.text, out.lang, 1)} aria-label={app.t('face.replay')}>
-          <Icon name="play" fill />
-        </button>
+        <div className="segmented small face-mode" role="tablist">
+          <button className={mode === 'live' ? 'on' : ''} onClick={() => switchMode('live')} role="tab" aria-selected={mode === 'live'}>
+            {app.t('live.mode')}
+          </button>
+          <button className={mode === 'tap' ? 'on' : ''} onClick={() => switchMode('tap')} role="tab" aria-selected={mode === 'tap'}>
+            {app.t('live.tap')}
+          </button>
+        </div>
+        {mode === 'live' ? (
+          <button
+            ref={(el) => {
+              live.levelEl.current = el;
+            }}
+            className={`live-control ${live.running ? 'running' : ''} ${live.state}`}
+            onClick={() => (live.running ? live.stop() : void live.start())}
+            aria-label={live.running ? app.t('live.stop') : app.t('live.start')}
+          >
+            {live.state === 'connecting' || live.state === 'reconnecting' ? <span className="spinner light" /> : <Icon name={live.running ? 'wave' : 'mic'} size={24} />}
+          </button>
+        ) : (
+          <button className="round-button" disabled={!out} onClick={() => out && speak(out.text, out.lang, 1)} aria-label={app.t('face.replay')}>
+            <Icon name="play" fill />
+          </button>
+        )}
         <button
           className={`round-button ${app.settings.autoSpeak ? 'on' : ''}`}
           onClick={() => app.setSettings((s) => ({ ...s, autoSpeak: !s.autoSpeak }))}
@@ -302,8 +362,54 @@ function FaceToFace({ talk, turns, onClose }: { talk: Talk; turns: Turn[]; onClo
           <Icon name={app.settings.autoSpeak ? 'speaker' : 'speakerOff'} />
         </button>
       </div>
-      <FaceHalf lang={app.my} talk={talk} last={last} />
+      {mode === 'live' ? <LiveHalf lang={app.my} live={live} /> : <FaceHalf lang={app.my} talk={talk} last={last} />}
     </div>
+  );
+}
+
+const LIVE_FAILURE: Record<string, TKey> = {
+  unsupported: 'live.unsupported',
+  denied: 'err.mic',
+  key: 'err.key',
+  quota: 'err.quota',
+  busy: 'live.busy',
+  network: 'err.network',
+};
+
+/** One person's half in real-time mode: what they need to read, in their own language. */
+function LiveHalf({ lang, live, flipped = false }: { lang: Lang; live: Live; flipped?: boolean }) {
+  const t = makeT(lang);
+  const current = live.caption.input || live.caption.output ? live.caption : live.last;
+  const speaker: Lang | null = current?.input ? (looksLike(current.input, 'ja') && !looksLike(current.input, 'ko') ? 'ja' : 'ko') : null;
+  const isSpeaker = speaker === lang;
+  const big = current ? (isSpeaker ? current.input : current.output) : '';
+  const small = current ? (isSpeaker ? current.output : current.input) : '';
+  const status =
+    live.state === 'connecting' ? t('live.connecting') : live.state === 'reconnecting' ? t('live.reconnecting') : live.running ? t('live.listening') : '';
+  return (
+    <section className={`face-half live-half ${flipped ? 'flipped' : ''}`} lang={lang}>
+      <div className="face-text">
+        {live.state === 'error' && live.failure ? (
+          <p className="face-error">{t(LIVE_FAILURE[live.failure] || 'live.busy')}</p>
+        ) : !live.running && !current ? (
+          <p className="face-hint">{t('live.hintIdle')}</p>
+        ) : big || small ? (
+          <>
+            <p className={`face-big ${isSpeaker ? 'own' : ''}`} lang={isSpeaker ? lang : undefined}>
+              {big || '…'}
+            </p>
+            {small && (
+              <p className="face-small" lang={isSpeaker ? undefined : speaker || undefined}>
+                <span>{small}</span>
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="face-hint">{status}</p>
+        )}
+      </div>
+      {live.running && <p className="live-status">{status}</p>}
+    </section>
   );
 }
 
@@ -329,7 +435,9 @@ function FaceHalf({ lang, talk, last, flipped = false }: { lang: Lang; talk: Tal
           <p className="face-error">{error}</p>
         ) : last ? (
           <>
-            <p className="face-big">{big}</p>
+            <p className="face-big" key={last.id}>
+              {big}
+            </p>
             {fromOther && (
               <p className="face-small">
                 <span lang={last.lang}>{textIn(last, last.lang)}</span>

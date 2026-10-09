@@ -3,10 +3,11 @@ import { Recorder, type Recording } from '../lib/audio';
 import { callGemini, GeminiError, MODELS, modelHealth, probeModel, recentLog } from '../lib/gemini';
 import { daysTogether, FILL_SCHEMA, fillPrompt, systemPrompt } from '../lib/prompts';
 import { dateKey, makeBackup, makeShareLink, mergeById, mergeGlossary, parseBackup, uid } from '../lib/store';
-import type { GlossaryItem, Lang, Profile, Turn } from '../lib/types';
+import type { GlossaryItem, Lang, Turn } from '../lib/types';
 import { useApp } from './AppContext';
 import { Icon } from './Icon';
 import { ErrorBox } from './MessageView';
+import { ProfileFields } from './ProfileFields';
 import { Sheet } from './Sheet';
 import { dayLabel } from './TalkView';
 import { copyText, textIn, TurnCard } from './TurnCard';
@@ -37,6 +38,8 @@ export function UsView() {
   }, [app.turns, query, starOnly]);
 
   const share = async () => {
+    // The link is readable by anyone who sees it; say exactly what goes in (Codex review C3).
+    if (!window.confirm(t('us.shareAsk', { n: Math.min(app.glossary.length, 60) }))) return;
     const base = `${location.origin}${location.pathname}`;
     const link = makeShareLink(profile, app.glossary, base);
     const text = t('us.sendText');
@@ -157,58 +160,6 @@ function DaySheet({ date, turns, onClose }: { date: string; turns: Turn[]; onClo
         ))}
       </div>
     </Sheet>
-  );
-}
-
-export function ProfileFields({ value, onChange, showLang = true }: { value: Profile; onChange: (p: Profile) => void; showLang?: boolean }) {
-  const { t } = useApp();
-  const set = (patch: Partial<Profile>) => onChange({ ...value, ...patch });
-  return (
-    <div className="form">
-      {showLang && (
-        <div className="field-row">
-          <span>{t('us.myLang')}</span>
-          <div className="segmented small">
-            {(['ko', 'ja'] as Lang[]).map((lang) => (
-              <button key={lang} className={value.myLang === lang ? 'on' : ''} onClick={() => set({ myLang: lang })}>
-                {lang === 'ko' ? '한국어' : '日本語'}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-      <label>
-        <span>{t('p.myName')}</span>
-        <input className="field" value={value.myName} onChange={(event) => set({ myName: event.target.value })} autoComplete="given-name" />
-      </label>
-      <label>
-        <span>{t('p.partnerName')}</span>
-        <input className="field" value={value.partnerName} onChange={(event) => set({ partnerName: event.target.value })} autoComplete="off" />
-      </label>
-      <label>
-        <span>{t('p.start')}</span>
-        <input className="field" type="date" value={value.startDate} onChange={(event) => set({ startDate: event.target.value })} />
-      </label>
-      <label>
-        <span>{t('p.meCalls')}</span>
-        <input className="field" value={value.meCalls} placeholder={t('p.callsPh')} onChange={(event) => set({ meCalls: event.target.value })} />
-      </label>
-      <label>
-        <span>{t('p.partnerCalls')}</span>
-        <input className="field" value={value.partnerCalls} placeholder={t('p.calledPh')} onChange={(event) => set({ partnerCalls: event.target.value })} />
-      </label>
-      <div className="field-row">
-        <span>{t('p.style')}</span>
-        <div className="segmented small">
-          <button className={value.style === 'casual' ? 'on' : ''} onClick={() => set({ style: 'casual' })}>
-            {t('p.casual')}
-          </button>
-          <button className={value.style === 'polite' ? 'on' : ''} onClick={() => set({ style: 'polite' })}>
-            {t('p.polite')}
-          </button>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -339,7 +290,7 @@ function Settings() {
 
   async function micTest() {
     if (mic.url) URL.revokeObjectURL(mic.url);
-    const recorder = new Recorder();
+    const recorder = new Recorder({ autoEnd: false });
     try {
       await recorder.start(3000);
       setMic({ state: 'rec' });
@@ -381,6 +332,9 @@ function Settings() {
         myName: prev.myName || data.profile.myName,
         partnerName: prev.partnerName || data.profile.partnerName,
         startDate: prev.startDate || data.profile.startDate,
+        meCalls: prev.meCalls || data.profile.meCalls,
+        partnerCalls: prev.partnerCalls || data.profile.partnerCalls,
+        style: data.profile.style,
       }));
       app.toast(t('us.restored', { n: data.turns.length + data.phrases.length }));
     } catch {
@@ -441,6 +395,22 @@ function Settings() {
           role="switch"
           aria-checked={settings.autoSpeak}
           onClick={() => setSettings((s) => ({ ...s, autoSpeak: !s.autoSpeak }))}
+        >
+          <i />
+        </button>
+      </div>
+
+      <div className="setting">
+        <div>
+          <b>{t('us.autoSend')}</b>
+          <small>{t('us.autoSendHelp')}</small>
+        </div>
+        <button
+          className={`switch ${settings.autoSend ? 'on' : ''}`}
+          role="switch"
+          aria-checked={settings.autoSend}
+          aria-label={t('us.autoSend')}
+          onClick={() => setSettings((s) => ({ ...s, autoSend: !s.autoSend }))}
         >
           <i />
         </button>

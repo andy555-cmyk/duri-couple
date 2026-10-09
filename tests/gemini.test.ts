@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { answerText, buildBody, callGemini, classify, GeminiError, MODELS, orderedModels, parseJsonLoose } from '../src/lib/gemini';
+import { answerText, buildBody, callGemini, callsLeft, classify, GeminiError, MODELS, orderedModels, parseJsonLoose, parseRetry } from '../src/lib/gemini';
 
 const ok = (obj: unknown, extra: Record<string, unknown> = {}) =>
   new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] }, finishReason: 'STOP', ...extra }] }), {
@@ -175,14 +175,114 @@ describe('hedging slow models', () => {
   });
 });
 
-describe('model order', () => {
-  it('puts the last good model first and cooling ones last', () => {
+describe('model order and pacing', () => {
+  it('keeps quality order and moves cooling or used-up models to the back', () => {
     const now = 1_000_000;
-    const order = orderedModels(now, {
-      [MODELS[0].id]: { skipUntil: now + 5000 },
-      [MODELS[2].id]: { okAt: now - 10 },
-    });
-    expect(order[0].id).toBe(MODELS[2].id);
+    const order = orderedModels(now, { [MODELS[0].id]: { skipUntil: now + 5000 } }, {});
+    expect(order[0].id).toBe(MODELS[1].id);
     expect(order[order.length - 1].id).toBe(MODELS[0].id);
+  });
+  it('switches model before hitting the per-minute limit', () => {
+    const now = 1_000_000;
+    const used = Array.from({ length: MODELS[0].perMinute }, (_, i) => now - 1000 * (i + 1));
+    const order = orderedModels(now, {}, { [MODELS[0].id]: used });
+    expect(order[0].id).toBe(MODELS[1].id);
+    expect(callsLeft(now, { [MODELS[0].id]: used })[MODELS[0].id]).toBe(0);
+  });
+  it('reads Google\'s retry delay and daily limits from a 429', () => {
+    const body = {
+      error: {
+        details: [
+          { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaValue: '5' }] },
+          { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '23s' },
+        ],
+      },
+    };
+    expect(parseRetry(body)).toEqual({ delayMs: 23000, daily: false, limit: 'GenerateRequestsPerMinutePerProjectPerModel 5' });
+    expect(parseRetry({ error: { details: [{ '@type': 'x.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }] } }).daily).toBe(true);
+  });
+});
+
+describe('streaming', () => {
+  const models = MODELS.slice(0, 3);
+  function sse(json: string, opts: { pieces?: number; firstDelay?: number; gap?: number } = {}) {
+    const n = opts.pieces ?? 5;
+    const size = Math.ceil(json.length / n);
+    const parts = Array.from({ length: n }, (_, i) => json.slice(i * size, (i + 1) * size)).filter(Boolean);
+    const encoder = new TextEncoder();
+    return (init: RequestInit) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const wait = (ms: number) =>
+              new Promise<void>((resolve, reject) => {
+                const t = setTimeout(resolve, ms);
+                init.signal?.addEventListener('abort', () => {
+                  clearTimeout(t);
+                  reject(new DOMException('aborted', 'AbortError'));
+                });
+              });
+            try {
+              await wait(opts.firstDelay ?? 0);
+              for (let i = 0; i < parts.length; i++) {
+                const last = i === parts.length - 1;
+                const event = { candidates: [{ content: { parts: [{ text: parts[i] }] }, ...(last ? { finishReason: 'STOP' } : {}) }] };
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\r\n\r\n`));
+                await wait(opts.gap ?? 1);
+              }
+              controller.close();
+            } catch (e) {
+              controller.error(e);
+            }
+          },
+        }),
+        { status: 200 },
+      );
+  }
+  function streamFetch(makers: ((init: RequestInit) => Response)[]) {
+    const urls: string[] = [];
+    const impl = (async (url: string, init: RequestInit) => {
+      urls.push(url);
+      return makers.shift()!(init);
+    }) as unknown as typeof fetch;
+    return { impl, urls };
+  }
+  it('shows words as they arrive and returns the whole answer', async () => {
+    const json = JSON.stringify({ said: '보고 싶어', translation: '会いたい', koKana: 'ポゴ シポ' });
+    const { impl, urls } = streamFetch([sse(json, { pieces: 30 })]);
+    const seen: string[] = [];
+    const result = await callGemini<any>({ key: 'k', system: 's', parts: [], models, fetchImpl: impl, onPartial: (p) => seen.push(String(p.value.translation ?? '')) });
+    expect(urls[0]).toContain(':streamGenerateContent?alt=sse');
+    expect(result.data).toEqual({ said: '보고 싶어', translation: '会いたい', koKana: 'ポゴ シポ' });
+    expect(seen.length).toBeGreaterThan(1);
+    expect(seen.some((t) => t && t !== '会いたい')).toBe(true);
+    expect(seen[seen.length - 1]).toBe('会いたい');
+  });
+  it('lets the first model to speak win when the first is slow to start', async () => {
+    const slow = JSON.stringify({ from: 'slow' });
+    const fast = JSON.stringify({ from: 'fast' });
+    const { impl } = streamFetch([sse(slow, { firstDelay: 400 }), sse(fast, { firstDelay: 10 })]);
+    const shownFrom = new Set<string>();
+    const result = await callGemini<any>({ key: 'k', system: 's', parts: [], models, hedgeMs: 50, fetchImpl: impl, onPartial: (_p, model) => shownFrom.add(model) });
+    expect(result.data.from).toBe('fast');
+    expect([...shownFrom]).toEqual([models[1].id]);
+  });
+  it('clears the screen and moves on when a streamed answer turns out unusable', async () => {
+    const bad = JSON.stringify({ lang: 'xx' });
+    const good = JSON.stringify({ lang: 'ja' });
+    const { impl } = streamFetch([sse(bad), sse(good)]);
+    let resets = 0;
+    const result = await callGemini<any>({
+      key: 'k',
+      system: 's',
+      parts: [],
+      models,
+      fetchImpl: impl,
+      onPartial: () => {},
+      onReset: () => resets++,
+      validate: (d) => (d.lang === 'ja' ? null : 'lang'),
+    });
+    expect(result.data.lang).toBe('ja');
+    expect(resets).toBe(1);
   });
 });

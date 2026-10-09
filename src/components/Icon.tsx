@@ -33,6 +33,7 @@ const PATHS: Record<string, string> = {
   download: 'M12 4v11 M7 10l5 5 5-5 M5 20h14',
   upload: 'M12 16V5 M7 10l5-5 5 5 M5 20h14',
   wave: 'M3 12h2 M7 8v8 M11 5v14 M15 9v6 M19 11v2',
+  bolt: 'M13 2 4 14h7l-1 8 9-12h-7l1-8Z',
 };
 
 export function Icon({ name, size = 20, fill = false, className }: { name: keyof typeof PATHS | string; size?: number; fill?: boolean; className?: string }) {

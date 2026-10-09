@@ -83,6 +83,8 @@ export interface Settings {
   apiKey: string;
   tone: Tone;
   autoSpeak: boolean;
+  /** Stop recording and translate as soon as the speaker goes quiet. */
+  autoSend: boolean;
   slowRate: number;
   onboarded: boolean;
 }

@@ -117,9 +117,18 @@ describe('store helpers', () => {
     const theirs = profileFromShare(payload!, DEFAULT_PROFILE);
     expect(theirs).toMatchObject({ myLang: 'ja', myName: '시오리', partnerName: 'Andy', meCalls: 'オッパ', partnerCalls: '시오리', startDate: '2026-01-01' });
   });
-  it('ignores broken links', () => {
+  it('ignores broken links and cleans tampered ones', () => {
     expect(readShareHash('#join=%%%')).toBeNull();
     expect(readShareHash('')).toBeNull();
+    const evil = btoa(JSON.stringify({ v: 1, fromLang: 'ko', fromName: { x: 1 }, startDate: 'soon', style: 'weird', glossary: [{ ko: 'a', ja: 'b' }, 5, { ko: 1 }] }))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const p = readShareHash(`#join=${evil}`)!;
+    expect(p.fromName).toBe('');
+    expect(p.startDate).toBe('');
+    expect(p.style).toBe('casual');
+    expect(p.glossary).toEqual([{ ko: 'a', ja: 'b' }]);
   });
   it('merges dictionaries without duplicates', () => {
     const merged = mergeGlossary([{ id: '1', ko: 'a', ja: 'b' }], [{ ko: 'a', ja: 'b' }, { ko: 'c', ja: 'd' }]);
@@ -136,7 +145,14 @@ describe('store helpers', () => {
     expect(missed.right).toBe(1);
   });
   it('restores backups by merging ids', () => {
-    const backup = parseBackup(JSON.stringify({ app: 'duri-couple', turns: [{ id: 'a', ts: 2 }], phrases: [], glossary: [] }));
+    const good = { id: 'a', ts: 2, lang: 'ko', ko: '안녕', ja: 'こんにちは' };
+    const backup = parseBackup(
+      JSON.stringify({ app: 'duri-couple', profile: { meCalls: '시오리', style: 'polite', myLang: 'xx' }, turns: [good, { id: 'bad' }, null], phrases: [{ id: 1 }], glossary: 'nope' }),
+    );
+    expect(backup.turns).toHaveLength(1);
+    expect(backup.phrases).toHaveLength(0);
+    expect(backup.glossary).toHaveLength(0);
+    expect(backup.profile).toMatchObject({ meCalls: '시오리', style: 'polite', myLang: 'ko' });
     expect(mergeById([{ id: 'b', ts: 1 }], backup.turns as any).map((x: any) => x.id)).toEqual(['b', 'a']);
     expect(() => parseBackup('{"app":"other"}')).toThrow();
   });

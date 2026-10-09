@@ -1,15 +1,17 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { AppProvider, useApp } from './components/AppContext';
 import { Icon } from './components/Icon';
-import { LearnView } from './components/LearnView';
-import { MessageView } from './components/MessageView';
 import { KeyForm, Onboarding } from './components/Onboarding';
 import { Sheet } from './components/Sheet';
 import { TalkView } from './components/TalkView';
-import { UsView } from './components/UsView';
 import { daysTogether } from './lib/prompts';
 import { initSpeech } from './lib/speech';
 import { mergeGlossary, profileFromShare, readShareHash, useSession, type SharePayload } from './lib/store';
+
+// The talk screen loads first; the other tabs load the first time they are opened.
+const MessageView = lazy(() => import('./components/MessageView').then((m) => ({ default: m.MessageView })));
+const LearnView = lazy(() => import('./components/LearnView').then((m) => ({ default: m.LearnView })));
+const UsView = lazy(() => import('./components/UsView').then((m) => ({ default: m.UsView })));
 
 type Tab = 'talk' | 'msg' | 'learn' | 'us';
 const TABS: { id: Tab; icon: string }[] = [
@@ -24,17 +26,25 @@ function useViewport() {
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
+    let frame = 0;
     const sync = () => {
-      document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
-      setKeyboard(window.innerHeight - vv.height > 140);
-      if (vv.offsetTop > 0) window.scrollTo(0, 0);
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
+        // Only a focused text field with an unzoomed page counts as "keyboard open" (Codex review I4).
+        const focused = !!document.activeElement?.matches('input, textarea, [contenteditable="true"]');
+        setKeyboard(focused && vv.scale <= 1.01 && window.innerHeight - vv.height > 140);
+      });
     };
     sync();
     vv.addEventListener('resize', sync);
-    vv.addEventListener('scroll', sync);
+    window.addEventListener('focusin', sync);
+    window.addEventListener('focusout', sync);
     return () => {
+      cancelAnimationFrame(frame);
       vv.removeEventListener('resize', sync);
-      vv.removeEventListener('scroll', sync);
+      window.removeEventListener('focusin', sync);
+      window.removeEventListener('focusout', sync);
     };
   }, []);
   return keyboard;
@@ -97,8 +107,9 @@ function Shell() {
             >
               <Icon name={settings.autoSpeak ? 'speaker' : 'speakerOff'} />
             </button>
-            <button className="icon-button" onClick={() => setFace(true)} aria-label={t('head.face')}>
-              <Icon name="face" />
+            <button className="live-pill" onClick={() => setFace(true)} aria-label={t('head.face')}>
+              <Icon name="bolt" size={16} fill />
+              {t('live.mode')}
             </button>
           </div>
         )}
@@ -106,9 +117,11 @@ function Shell() {
 
       <main className={`screen ${tab === 'talk' ? 'fixed' : ''}`}>
         {tab === 'talk' && <TalkView face={face} onCloseFace={() => setFace(false)} />}
-        {tab === 'msg' && <MessageView />}
-        {tab === 'learn' && <LearnView />}
-        {tab === 'us' && <UsView />}
+        <Suspense fallback={<div className="page loading-page"><span className="spinner" /></div>}>
+          {tab === 'msg' && <MessageView />}
+          {tab === 'learn' && <LearnView />}
+          {tab === 'us' && <UsView />}
+        </Suspense>
       </main>
 
       <nav className="tabbar" aria-label="tabs">

@@ -54,15 +54,73 @@ function answer(prompt: string, hasAudio: boolean) {
   return { heard: true, lang: hasAudio ? 'ko' : 'ja', ...SAMPLES.ko };
 }
 
-export const mockFetch = (async (_url: string, init: RequestInit) => {
+export const mockFetch = (async (url: string, init: RequestInit) => {
   const body = JSON.parse(String(init.body));
   const parts: any[] = body.contents?.[0]?.parts || [];
   const prompt = parts.map((p) => p.text || '').join('\n');
   const hasAudio = parts.some((p) => p.inlineData);
-  await new Promise((resolve) => setTimeout(resolve, hasAudio ? 1400 : 700));
-  if ((init.signal as AbortSignal | undefined)?.aborted) throw new DOMException('aborted', 'AbortError');
-  return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(answer(prompt, hasAudio)) }] }, finishReason: 'STOP' }] }), {
-    status: 200,
-    headers: { 'content-type': 'application/json' },
+  const signal = init.signal as AbortSignal | undefined;
+  const text = JSON.stringify(answer(prompt, hasAudio));
+  const wait = (ms: number) =>
+    new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, ms);
+      signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new DOMException('aborted', 'AbortError'));
+      });
+    });
+  if (!String(url).includes('streamGenerateContent')) {
+    await wait(hasAudio ? 1400 : 700);
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  // Same shape as the real server-sent events: a first-word delay, then small pieces.
+  const encoder = new TextEncoder();
+  const pieces = text.match(/[\s\S]{1,14}/g) || [];
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        await wait(hasAudio ? 900 : 500);
+        for (let i = 0; i < pieces.length; i++) {
+          const last = i === pieces.length - 1;
+          const event = { candidates: [{ content: { parts: [{ text: pieces[i] }] }, ...(last ? { finishReason: 'STOP' } : {}) }] };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\r\n\r\n`));
+          await wait(35);
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
   });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
 }) as unknown as typeof fetch;
+
+/** Dev-only stand-in for a live session: scripted exchanges, alternating Korean and Japanese. */
+export function runLiveMock(handle: (content: any) => void, level: (v: number) => void, ready: () => void) {
+  const script = [
+    ['오늘 진짜 고마웠어. ', '다음 주에 또 만나자.', '今日は本当にありがとう。', 'また来週会おうね。'],
+    ['今日は本当に', '楽しかった。', '오늘 진짜 ', '즐거웠어.'],
+  ];
+  let stopped = false;
+  const timers: number[] = [];
+  const at = (ms: number, fn: () => void) => timers.push(window.setTimeout(() => !stopped && fn(), ms));
+  at(400, ready);
+  let t = 900;
+  for (let round = 0; round < 6; round++) {
+    const [in1, in2, out1, out2] = script[round % 2];
+    for (let k = 0; k < 12; k++) at(t + k * 120, () => level(0.25 + Math.random() * 0.5));
+    at(t + 300, () => handle({ inputTranscription: { text: in1 } }));
+    at(t + 900, () => handle({ inputTranscription: { text: in2 } }));
+    at(t + 1500, () => level(0));
+    at(t + 2500, () => handle({ outputTranscription: { text: out1 } }));
+    at(t + 2900, () => handle({ outputTranscription: { text: out2 }, turnComplete: true }));
+    t += 5200;
+  }
+  return () => {
+    stopped = true;
+    timers.forEach((id) => clearTimeout(id));
+  };
+}

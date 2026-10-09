@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { blobToBase64, callGemini, failureOf, GeminiError, type Part } from '../lib/gemini';
 import {
   systemPrompt,
@@ -10,6 +10,7 @@ import {
   validateWrite,
   writePrompt,
   WRITE_SCHEMA,
+  looksLike,
   type UnderstandJson,
   type WriteJson,
 } from '../lib/prompts';
@@ -36,10 +37,39 @@ export function MessageView() {
   const [lastIn, setLastIn] = useSession<string | null>('duri.msg.lastIn', null);
   const [lastOut, setLastOut] = useSession<string | null>('duri.msg.lastOut', null);
   const seconds = useElapsed(!!busy, since);
+  const [live, setLive] = useState<{ mode: Mode; value: Record<string, any>; open: string | null } | null>(null);
+  const frame = useRef(0);
+  const latest = useRef<typeof live>(null);
+  const showLive = (next: typeof live) => {
+    latest.current = next;
+    if (frame.current) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = 0;
+      setLive(latest.current);
+    });
+  };
+  const endLive = () => {
+    cancelAnimationFrame(frame.current);
+    frame.current = 0;
+    latest.current = null;
+    setLive(null);
+  };
 
   const inTurn = useMemo(() => app.turns.find((x) => x.id === lastIn) || null, [app.turns, lastIn]);
   const outTurn = useMemo(() => app.turns.find((x) => x.id === lastOut) || null, [app.turns, lastOut]);
   const recent = useMemo(() => app.turns.filter((x) => x.channel === (mode === 'in' ? 'msg-in' : 'msg-out')).slice(-6).reverse(), [app.turns, mode]);
+
+  const inFlight = useRef<AbortController | null>(null);
+  useEffect(() => () => inFlight.current?.abort(), []);
+  const begin = () => {
+    if (inFlight.current) return null;
+    const controller = new AbortController();
+    inFlight.current = controller;
+    return controller;
+  };
+  const end = (controller: AbortController) => {
+    if (inFlight.current === controller) inFlight.current = null;
+  };
 
   const fail = (caught: unknown) => {
     const kind = caught instanceof GeminiError ? caught.kind : (caught as Error)?.message || '';
@@ -50,6 +80,8 @@ export function MessageView() {
     const text = inText.trim();
     if (!text || busy) return;
     if (!settings.apiKey) return fail(new GeminiError('nokey'));
+    const controller = begin();
+    if (!controller) return;
     setBusy('in');
     setSince(Date.now());
     setError(null);
@@ -60,8 +92,12 @@ export function MessageView() {
         parts: [{ text: understandPrompt({ profile: app.profile, turns: app.turns, text }) }],
         schema: UNDERSTAND_SCHEMA,
         validate: (data) => validateUnderstand(data, app.profile),
-        hedgeMs: 8000,
+        hedgeMs: 4000,
+        onPartial: (p) => showLive({ mode: 'in', value: p.value as Record<string, any>, open: p.open }),
+        onReset: () => showLive(null),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       if (result.invalid === 'translation') throw failureOf(result);
       const turn = turnFromUnderstand(result.data, text, { model: result.model, ms: result.ms, id: uid(), ts: Date.now(), myLang: my });
       app.setTurns((prev) => [...prev, turn]);
@@ -70,6 +106,8 @@ export function MessageView() {
     } catch (caught) {
       fail(caught);
     } finally {
+      end(controller);
+      endLive();
       setBusy(null);
     }
   }
@@ -78,6 +116,8 @@ export function MessageView() {
     const text = outText.trim();
     if ((!text && !audio) || busy) return;
     if (!settings.apiKey) return fail(new GeminiError('nokey'));
+    const controller = begin();
+    if (!controller) return;
     setBusy('out');
     setSince(Date.now());
     setError(null);
@@ -100,8 +140,12 @@ export function MessageView() {
         schema: WRITE_SCHEMA,
         validate: (data) => validateWrite(data, app.profile),
         timeoutMs: audio ? 30000 : 25000,
-        hedgeMs: audio ? 10000 : 8000,
+        hedgeMs: audio ? 5000 : 4000,
+        onPartial: (p) => showLive({ mode: 'out', value: p.value as Record<string, any>, open: p.open }),
+        onReset: () => showLive(null),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       const turn = turnFromWrite(result.data, { profile: app.profile, input: audio ? 'voice' : 'text', model: result.model, ms: result.ms, id: uid(), ts: Date.now() });
       if (!turn.lines?.length) throw failureOf(result);
       app.setTurns((prev) => [...prev, turn]);
@@ -110,6 +154,8 @@ export function MessageView() {
     } catch (caught) {
       fail(caught);
     } finally {
+      end(controller);
+      endLive();
       setBusy(null);
     }
   }
@@ -156,7 +202,8 @@ export function MessageView() {
           </div>
           {!inTurn && !busy && <p className="hint-text">{t('msg.emptyIn')}</p>}
           {error && <ErrorBox error={error} onClose={() => setError(null)} />}
-          {inTurn && (
+          {busy === 'in' && live?.mode === 'in' && <LiveUnderstand live={live} />}
+          {inTurn && busy !== 'in' && (
             <article className="result-card">
               <p className="result-main" lang={my}>
                 {textIn(inTurn, my)}
@@ -251,7 +298,8 @@ export function MessageView() {
           </div>
           {!outTurn && !busy && <p className="hint-text">{t('msg.emptyOut')}</p>}
           {error && <ErrorBox error={error} onClose={() => setError(null)} />}
-          {outTurn && (
+          {busy === 'out' && live?.mode === 'out' && <LiveWrite live={live} />}
+          {outTurn && busy !== 'out' && (
             <div className="line-stack">
               {outTurn.note && <p className="turn-note">{outTurn.note}</p>}
               {(outTurn.lines || []).map((line, index) => (
@@ -282,6 +330,83 @@ export function MessageView() {
           ))}
         </section>
       )}
+    </div>
+  );
+}
+
+const Caret = () => <span className="caret" aria-hidden="true" />;
+
+/** The received-message answer as it streams in. */
+function LiveUnderstand({ live }: { live: { value: Record<string, any>; open: string | null } }) {
+  const { t, my, their } = useApp();
+  const v = live.value;
+  const replies: any[] = Array.isArray(v.replies) ? v.replies.filter((r) => r?.text && looksLike(String(r.text), their)) : [];
+  return (
+    <article className="result-card streaming" aria-live="off">
+      {v.translation ? (
+        <p className="result-main" lang={my}>
+          {v.translation}
+          {live.open === 'translation' && <Caret />}
+        </p>
+      ) : (
+        <>
+          <div className="skeleton" />
+          <div className="skeleton short" />
+        </>
+      )}
+      {v.nuance && (
+        <div className="note-box">
+          <b>{t('msg.nuance')}</b>
+          <p>
+            {v.nuance}
+            {live.open === 'nuance' && <Caret />}
+          </p>
+        </div>
+      )}
+      {replies.length > 0 && (
+        <>
+          <h3 className="section-label">{t('msg.replies')}</h3>
+          <div className="line-stack">
+            {replies.map((r, i) => (
+              <div className="line-card arriving" key={i}>
+                <p className="line-text" lang={their}>
+                  {r.text}
+                </p>
+                {r.reading && <p className="reading">{r.reading}</p>}
+                {r.meaning && <p className="line-meaning">{r.meaning}</p>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </article>
+  );
+}
+
+/** The three outgoing options as each one fills in. */
+function LiveWrite({ live }: { live: { value: Record<string, any>; open: string | null } }) {
+  const { their } = useApp();
+  const lines: any[] = Array.isArray(live.value.lines) ? live.value.lines.filter((l) => l?.text && looksLike(String(l.text), their)) : [];
+  if (!lines.length)
+    return (
+      <div className="line-card streaming">
+        <div className="skeleton" />
+        <div className="skeleton short" />
+      </div>
+    );
+  return (
+    <div className="line-stack" aria-live="off">
+      {lines.map((l, i) => (
+        <div className="line-card arriving" key={i}>
+          {l.label && <span className="line-label">{l.label}</span>}
+          <p className="line-text" lang={their}>
+            {l.text}
+            {i === lines.length - 1 && live.open === 'lines' && <Caret />}
+          </p>
+          {l.reading && <p className="reading">{l.reading}</p>}
+          {l.meaning && <p className="line-meaning">{l.meaning}</p>}
+        </div>
+      ))}
     </div>
   );
 }

@@ -142,7 +142,7 @@ function TurnCardInner({ turn, onChange, onDelete, partnerLabel }: { turn: Turn;
   const channelIcon = turn.channel === 'talk' ? null : <Icon name="message" size={12} />;
 
   return (
-    <article className={`turn ${mine ? 'mine' : 'theirs'} ${turn.star ? 'starred' : ''}`}>
+    <article className={`turn ${mine ? 'mine' : 'theirs'} ${turn.star ? 'starred' : ''} ${Date.now() - turn.ts < 6000 ? 'fresh' : ''}`}>
       <div className="turn-meta">
         {channelIcon}
         <span>{mine ? t('turn.mine') : partnerLabel}</span>

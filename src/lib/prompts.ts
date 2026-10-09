@@ -322,7 +322,7 @@ export function turnFromUnderstand(json: UnderstandJson, text: string, meta: { m
     lines: (json.replies || [])
       .filter((r) => r?.text && looksLike(r.text, other(meta.myLang)))
       .slice(0, 3)
-      .map((r) => ({ ...r, text: stripFurigana(r.text) })),
+      .map((r) => ({ ...r, text: stripFurigana(r.text), reading: cleanReading(r.reading, meta.myLang === 'ko' ? 'hangul' : 'kana') })),
     model: meta.model,
     ms: meta.ms,
   };
@@ -393,7 +393,7 @@ export function turnFromWrite(json: WriteJson, meta: { profile: Profile; input: 
   const lines = (json.lines || [])
     .filter((l) => l?.text && looksLike(l.text, other(mine)))
     .slice(0, 3)
-    .map((l) => ({ ...l, text: stripFurigana(l.text) }));
+    .map((l) => ({ ...l, text: stripFurigana(l.text), reading: cleanReading(l.reading, mine === 'ko' ? 'hangul' : 'kana') }));
   const first = lines[0] || { text: '', reading: '' };
   const said = (json.said || '').trim();
   return {
@@ -515,4 +515,74 @@ export function fillPrompt(item: { ko: string; ja: string; note?: string }): str
     `If it is a personal name, transliterate (Korean name → katakana, Japanese name → hangul).`,
     `Return JSON: {"ko": "...", "ja": "..."}`,
   ].join('\n');
+}
+
+/* ---------- real-time interpreting (Gemini Live) ---------- */
+
+/**
+ * Instructions for the Live model. Measured 2026-10-09 (duri-lab/live/general.mjs): with a 1 s pause
+ * setting and the "never guess" rule both directions came back exact and casual, ~1.1 s after speech;
+ * with 0.5 s it split a sentence at a pause and invented the rest.
+ */
+export function livePrompt(profile: Profile, glossary: GlossaryItem[]): string {
+  const n = names(profile);
+  const casual = profile.style !== 'polite';
+  const dict = glossary
+    .filter((g) => g.ko.trim() && g.ja.trim())
+    .slice(0, 60)
+    .map((g) => `${g.ko.trim()} = ${g.ja.trim()}`)
+    .join('; ');
+  return [
+    `You are the live interpreter between two lovers: ${n.ko} (speaks Korean) and ${n.ja} (speaks Japanese).`,
+    casual
+      ? 'Whenever you hear Korean, say it in natural casual Japanese (タメ口). Whenever you hear Japanese, say it in natural casual Korean (반말).'
+      : 'Whenever you hear Korean, say it in gentle polite Japanese (です/ます). Whenever you hear Japanese, say it in gentle polite Korean (해요체).',
+    'Keep the meaning exactly. Never answer, comment, greet or add anything: speak only the translation, warmly, in the speaker\'s mood.',
+    'Translate only the words you actually heard in this utterance. If it sounds cut off, translate just that fragment. Never guess and never reuse an earlier sentence.',
+    `Personal names are never translated: ${n.ko} and ${n.ja} keep their sound in the other language.`,
+    dict ? `Couple dictionary (always use these words): ${dict}.` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export const READINGS_SCHEMA = {
+  type: 'object',
+  properties: { koKana: str, jaHangul: str },
+  required: ['koKana', 'jaHangul'],
+};
+
+export function readingsPrompt(ko: string, ja: string): string {
+  return [
+    `Korean: «${ko}»`,
+    `Japanese: «${ja}»`,
+    'Return JSON: {"koKana": katakana ONLY reading of the Korean, "jaHangul": hangul ONLY reading of the Japanese}, following the reading rules.',
+  ].join('\n');
+}
+
+export function validateReadings(json: { koKana: string; jaHangul: string }): string | null {
+  if (!readingOk(json.koKana || '', 'kana') || !String(json.koKana || '').trim()) return 'koKana';
+  if (!readingOk(json.jaHangul || '', 'hangul') || !String(json.jaHangul || '').trim()) return 'jaHangul';
+  return null;
+}
+
+/** A finished live exchange becomes an ordinary turn (readings are filled in afterwards). */
+export function turnFromLive(input: string, output: string, meta: { id: string; ts: number; model: string }): Turn | null {
+  const said = input.trim();
+  const heard = output.trim();
+  if (!said || !heard) return null;
+  const lang: Lang = looksLike(said, 'ja') && !looksLike(said, 'ko') ? 'ja' : 'ko';
+  if (!looksLike(heard, other(lang))) return null;
+  return {
+    id: meta.id,
+    ts: meta.ts,
+    lang,
+    channel: 'talk',
+    input: 'voice',
+    ko: lang === 'ko' ? said : heard,
+    ja: lang === 'ja' ? said : heard,
+    koKana: '',
+    jaHangul: '',
+    model: meta.model,
+  };
 }

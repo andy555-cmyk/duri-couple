@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { blobToBase64, callGemini, failureOf, GeminiError } from '../lib/gemini';
 import {
   DAILY_SCHEMA,
@@ -25,6 +25,9 @@ import { ErrorBox } from './MessageView';
 import { Sheet } from './Sheet';
 import { SpeakButtons } from './TurnCard';
 import { useElapsed, useVoice } from './useVoice';
+
+let dailyInFlight = false;
+let dailyTried = '';
 
 interface Card {
   target: string;
@@ -62,8 +65,9 @@ export function LearnView() {
   };
 
   async function fetchDaily() {
-    if (dailyBusy) return;
+    if (dailyBusy || dailyInFlight) return;
     if (!settings.apiKey) return fail(new GeminiError('nokey'));
+    dailyInFlight = true;
     setDailyBusy(true);
     setError(null);
     try {
@@ -90,14 +94,15 @@ export function LearnView() {
     } catch (caught) {
       fail(caught);
     } finally {
+      dailyInFlight = false;
       setDailyBusy(false);
     }
   }
 
-  const autoTried = useRef(false);
   useEffect(() => {
-    if (autoTried.current || !settings.apiKey || app.daily?.date === today) return;
-    autoTried.current = true;
+    // Once per day per app session, however often the tab is reopened (Codex review B2).
+    if (dailyTried === today || !settings.apiKey || app.daily?.date === today) return;
+    dailyTried = today;
     void fetchDaily();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.apiKey]);

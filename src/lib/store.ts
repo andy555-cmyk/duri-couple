@@ -25,6 +25,7 @@ export const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   tone: 'natural',
   autoSpeak: true,
+  autoSend: true,
   slowRate: 0.6,
   onboarded: false,
 };
@@ -54,13 +55,19 @@ export function load<T>(key: string, fallback: T): T {
   }
 }
 
+// A failed save stays on the list until that same key saves again, so the warning cannot be
+// cleared by some other, smaller save succeeding (Codex review B6).
+const failedKeys = new Set<string>();
+
 export function save(key: string, value: unknown) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
-    storageListener?.(true);
+    failedKeys.delete(key);
   } catch {
-    storageListener?.(false);
+    failedKeys.add(key);
   }
+  storageListener?.(failedKeys.size === 0);
+  return !failedKeys.has(key);
 }
 
 /** useState that mirrors itself into localStorage. */
@@ -88,14 +95,19 @@ export function useSession<T>(key: string, fallback: T): [T, (next: T) => void] 
       return fallback;
     }
   });
+  const timer = useRef(0);
   const update = useCallback(
     (next: T) => {
       setValue(next);
-      try {
-        sessionStorage.setItem(key, JSON.stringify(next));
-      } catch {
-        /* private mode */
-      }
+      // Typing would otherwise write on every keystroke (Codex review S5).
+      clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => {
+        try {
+          sessionStorage.setItem(key, JSON.stringify(next));
+        } catch {
+          /* private mode */
+        }
+      }, 250);
     },
     [key],
   );
@@ -175,19 +187,36 @@ export function makeShareLink(profile: Profile, glossary: GlossaryItem[], base: 
     fromCalls: profile.meCalls,
     toCalls: profile.partnerCalls,
     style: profile.style,
-    glossary: glossary.map(({ ko, ja, note }) => ({ ko, ja, ...(note ? { note } : {}) })),
+    glossary: glossary.slice(0, SHARE_GLOSSARY_LIMIT).map(({ ko, ja, note }) => ({ ko, ja, ...(note ? { note } : {}) })),
   };
   return `${base}#join=${toBase64Url(JSON.stringify(payload))}`;
 }
 
+const text = (v: unknown, max = 60) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+export const SHARE_GLOSSARY_LIMIT = 60;
+
+/** Reads a share link, keeping only well-formed, size-limited fields (Codex review B8). */
 export function readShareHash(hash: string): SharePayload | null {
-  const match = hash.match(/join=([A-Za-z0-9_-]+)/);
+  const match = hash.match(/join=([A-Za-z0-9_-]{1,12000})/);
   if (!match) return null;
   try {
-    const payload = JSON.parse(fromBase64Url(match[1]));
-    if (payload?.v !== 1 || (payload.fromLang !== 'ko' && payload.fromLang !== 'ja')) return null;
-    if (!Array.isArray(payload.glossary)) payload.glossary = [];
-    return payload as SharePayload;
+    const raw = JSON.parse(fromBase64Url(match[1]));
+    if (raw?.v !== 1 || (raw.fromLang !== 'ko' && raw.fromLang !== 'ja')) return null;
+    const glossary = (Array.isArray(raw.glossary) ? raw.glossary : [])
+      .filter((g: any) => g && typeof g.ko === 'string' && typeof g.ja === 'string' && (g.ko.trim() || g.ja.trim()))
+      .slice(0, SHARE_GLOSSARY_LIMIT)
+      .map((g: any) => ({ ko: text(g.ko, 80), ja: text(g.ja, 80), ...(text(g.note, 80) ? { note: text(g.note, 80) } : {}) }));
+    return {
+      v: 1,
+      fromLang: raw.fromLang,
+      fromName: text(raw.fromName),
+      toName: text(raw.toName),
+      startDate: /^\d{4}-\d{2}-\d{2}$/.test(raw.startDate) ? raw.startDate : '',
+      fromCalls: text(raw.fromCalls),
+      toCalls: text(raw.toCalls),
+      style: raw.style === 'polite' ? 'polite' : 'casual',
+      glossary,
+    };
   } catch {
     return null;
   }
@@ -232,19 +261,31 @@ export function makeBackup(data: Omit<Backup, 'app' | 'v' | 'exportedAt'>): Back
   return { app: 'duri-couple', v: 2, exportedAt: new Date().toISOString(), ...data };
 }
 
+const isTurn = (t: any): t is Turn =>
+  t && typeof t.id === 'string' && typeof t.ts === 'number' && (t.lang === 'ko' || t.lang === 'ja') && typeof t.ko === 'string' && typeof t.ja === 'string';
+const isPhrase = (p: any): p is Phrase =>
+  p && typeof p.id === 'string' && typeof p.ko === 'string' && typeof p.ja === 'string' && typeof p.box === 'number' && typeof p.due === 'number';
+const isGloss = (g: any): g is GlossaryItem => g && typeof g.id === 'string' && typeof g.ko === 'string' && typeof g.ja === 'string';
+
+/** Reads a backup file; malformed entries are dropped instead of breaking the screens (Codex review B7). */
 export function parseBackup(text: string): Backup {
   const data = JSON.parse(text);
   if (data?.app !== 'duri-couple') throw new Error('not a backup');
+  const profile = { ...DEFAULT_PROFILE, ...(typeof data.profile === 'object' && data.profile ? data.profile : {}) };
+  for (const key of ['myName', 'partnerName', 'startDate', 'meCalls', 'partnerCalls'] as const) profile[key] = text_(profile[key]);
+  if (profile.myLang !== 'ko' && profile.myLang !== 'ja') profile.myLang = 'ko';
+  if (profile.style !== 'polite') profile.style = 'casual';
   return {
     app: 'duri-couple',
     v: 2,
     exportedAt: String(data.exportedAt || ''),
-    profile: { ...DEFAULT_PROFILE, ...(data.profile || {}) },
-    turns: Array.isArray(data.turns) ? data.turns : [],
-    phrases: Array.isArray(data.phrases) ? data.phrases : [],
-    glossary: Array.isArray(data.glossary) ? data.glossary : [],
+    profile,
+    turns: (Array.isArray(data.turns) ? data.turns : []).filter(isTurn),
+    phrases: (Array.isArray(data.phrases) ? data.phrases : []).filter(isPhrase),
+    glossary: (Array.isArray(data.glossary) ? data.glossary : []).filter(isGloss),
   };
 }
+const text_ = (v: unknown) => (typeof v === 'string' ? v.slice(0, 80) : '');
 
 export function mergeById<T extends { id: string; ts?: number }>(current: T[], incoming: T[]): T[] {
   const map = new Map(current.map((item) => [item.id, item]));

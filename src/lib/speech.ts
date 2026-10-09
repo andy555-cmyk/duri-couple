@@ -12,6 +12,13 @@ export function initSpeech() {
   };
   load();
   window.speechSynthesis.addEventListener?.('voiceschanged', load);
+  // iOS may re-lock speech after the app was in the background; unlock again on the next tap.
+  const relock = () => {
+    unlocked = false;
+    load();
+  };
+  window.addEventListener('pageshow', relock);
+  document.addEventListener('visibilitychange', () => !document.hidden && relock());
 }
 
 const PREFERRED = ['premium', 'enhanced', 'siri', 'kyoko', 'o-ren', 'yuna', 'google'];
