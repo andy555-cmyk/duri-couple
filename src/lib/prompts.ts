@@ -36,8 +36,10 @@ export const cleanReading = (text: string | undefined, script: 'kana' | 'hangul'
 /** Removes furigana like 今日(きょう) that weaker models sometimes add. */
 export const stripFurigana = (text: string) => text.replace(/([\u4e00-\u9fff\u3005]+)[(（][\u3041-\u3096\u30a1-\u30faー]+[)）]/g, '$1');
 
-/** Quoted phrases may legitimately be in the other language (「사랑해」って言って). */
-const unquoted = (text: string) => text.replace(/「[^」]*」|『[^』]*』|"[^"]*"|“[^”]*”/g, '');
+/** Quoted phrases may legitimately be in the other language (「사랑해」って言って, ‘好き’라고 말해 줘). */
+const unquoted = (text: string) => text.replace(/「[^」]*」|『[^』]*』|"[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|（[^）]*）|\([^)]*\)|\[[^\]]*\]/g, '');
+/** Laughs, cries, emoji and punctuation alone belong to no language (ｗｗ, ㅋㅋ, 😭). */
+const CHAT_ONLY = /^[\s\p{Extended_Pictographic}\uFE0F\u200Dｗwㅋㅎㅠㅜ笑泣!?！？…〜~.。、,♡♥]+$/u;
 const ANY_HANGUL = /[\uac00-\ud7a3\u3131-\u318e]/;
 const ANY_JAPANESE = /[\u3041-\u3096\u30a1-\u30fa\u31f0-\u31ff\u4e00-\u9fff\u3005]/;
 
@@ -46,8 +48,11 @@ const ANY_JAPANESE = /[\u3041-\u3096\u30a1-\u30fa\u31f0-\u31ff\u4e00-\u9fff\u300
  * Korean are defects in a translation (Codex review2 M7). Quoted phrases are allowed.
  */
 export function cleanIn(text: string, lang: Lang): boolean {
-  if (!looksLike(text, lang)) return false;
-  const bare = unquoted(text);
+  const bare = unquoted(text).trim();
+  // All of it in quotes (「사랑해」 as a "translation") is judged as it is.
+  if (!bare) return looksLike(text, lang);
+  if (CHAT_ONLY.test(bare)) return true;
+  if (!looksLike(bare, lang)) return false;
   return lang === 'ja' ? !ANY_HANGUL.test(bare) : !ANY_JAPANESE.test(bare);
 }
 
@@ -88,19 +93,21 @@ const ADDRESS_GENDER: [RegExp, Gender, Gender][] = [
 
 /** When the profile leaves gender open, 오빠/언니/누나/형 in the nicknames still tell (she calls him オッパ). */
 export function inferGenders(profile: Profile): { me: Gender; partner: Gender } {
-  let me: Gender = '';
-  let partner: Gender = '';
+  const me = new Set<Gender>();
+  const partner = new Set<Gender>();
   for (const [term, speaker, listener] of ADDRESS_GENDER) {
     if (term.test(profile.partnerCalls.trim())) {
-      partner ||= speaker;
-      me ||= listener;
+      partner.add(speaker);
+      me.add(listener);
     }
     if (term.test(profile.meCalls.trim())) {
-      me ||= speaker;
-      partner ||= listener;
+      me.add(speaker);
+      partner.add(listener);
     }
   }
-  return { me, partner };
+  // Only when every hint agrees (a playful '오빠/누나' says nothing) — Codex review3.
+  const one = (set: Set<Gender>): Gender => (set.size === 1 ? [...set][0] : '');
+  return { me: one(me), partner: one(partner) };
 }
 
 /** Gender of the Korean speaker and of the Japanese speaker: as set in the profile, else as the nicknames imply. */
@@ -285,7 +292,10 @@ export function worthAlt(alt: string, translation: string, meaning: string): boo
   if (!alt || !meaning.trim()) return false;
   const a = bare(alt);
   const t = bare(translation);
-  return distance(a, t) > Math.max(2, Math.round(t.length * 0.15));
+  const d = distance(a, t);
+  // A changed ending or word can be the better line (会いたいな → 会いたいよ, 통화할래 → 전화할래);
+  // one letter off in a long line is a slip (쉬는 날이래 → 쉬는 날이데). Codex review3.
+  return d > 1 || (d === 1 && t.length < 8);
 }
 
 export function turnFromTalk(json: TalkJson, meta: { channel?: Turn['channel']; input: Turn['input']; model: string; ms: number; id: string; ts: number }): Turn {

@@ -225,7 +225,8 @@ export class Recorder {
       this.chunks = [];
       this.discard = false;
       this.noSpeech = false;
-      this.gate = this.opts.autoEnd ? new SpeechGate(this.opts.silenceMs ?? 1500) : undefined;
+      // 1.8 s: a thinking pause mid-sentence must not send half a sentence (Codex review3 M5).
+      this.gate = this.opts.autoEnd ? new SpeechGate(this.opts.silenceMs ?? 1800) : undefined;
       this.recorder.ondataavailable = (event) => {
         if (event.data && event.data.size) this.chunks.push(event.data);
       };

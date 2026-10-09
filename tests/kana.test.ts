@@ -54,6 +54,14 @@ describe('Korean → katakana, with the sound changes a learner hears', () => {
     ['명동역', 'ミョンドンニョㇰ'],
     ['번역', 'ポニョㇰ'],
     ['여덟', 'ヨドㇽ'],
+    // Codex review3 (2026-10-10)
+    ['밥 안 먹었어?', 'パ バン モゴッソ?'],
+    ['못 알아들었어', 'モ ダラドゥロッソ'],
+    ['꽃 위에', 'コ ドゥィエ'],
+    ['개인기 보여 줘', 'ケインギ ポヨ チョ'],
+    ['인기 많아', 'インキ マナ'],
+    ['조금 길게 말해 줘', 'チョグㇺ キㇽゲ マㇽヘ チョ'],
+    ['내가 할게', 'ネガ ハㇽケ'],
     ['시오리', 'シオリ'],
     ['우리 라멘집', 'ウリ ラメンジㇷ゚'],
     ['보고 싶어서 잠이 안 와 🥺', 'ポゴ シポソ チャミ アン ワ 🥺'],
@@ -94,7 +102,8 @@ describe('Japanese pronunciation kana → hangul', () => {
     // Real answer, 2026-10-10: an emoji inside the kana must not cost the whole reading.
     expect(isKanaOnly('しおり きょーわ いろいろ おつかれさま 😭 はやく やすんでね')).toBe(true);
     expect(isKanaOnly('えっ まじ ｗｗ')).toBe(true);
-    expect(kanaToHangul('えっ まじ ｗｗ')).toBe('에 마지 ㅋㅋ');
+    expect(kanaToHangul('えっ まじ ｗｗ')).toBe('엣 마지 ㅋㅋ');
+    expect(kanaToHangul('えっ、ほんと？')).toBe('엣, 혼토?');
     expect(isKanaOnly('今日わ')).toBe(false);
     expect(isKanaOnly('쿄ー')).toBe(false);
     expect(isKanaOnly('')).toBe(false);

@@ -88,7 +88,13 @@ const SPOKEN_AS: [string, string][] = [
   ['여권', '여꿘'], ['문법', '문뻡'], ['글자', '글짜'], ['인기', '인끼'], ['성격', '성껵'], ['물가', '물까'], ['사건', '사껀'], ['조건', '조껀'],
   ['손가락', '손까락'], ['발가락', '발까락'], ['눈길', '눈낄'], ['밤길', '밤낄'], ['산길', '산낄'], ['물고기', '물꼬기'],
 ];
-const spokenAs = (word: string) => SPOKEN_AS.reduce((w, [from, to]) => (w.includes(from) ? w.split(from).join(to) : w), word);
+// Only at the start of a word: 개인기 is not 인기 (Codex review3).
+const spokenAs = (word: string) => {
+  const hit = SPOKEN_AS.find(([from]) => word.startsWith(from));
+  return hit ? hit[1] + word.slice(hit[0].length) : word;
+};
+// Adverbs on -게 from ㄹ stems are not the promise ending: 길게, 멀게, 힘들게 stay soft.
+const SOFT_GE = /^(?:길|멀|달|힘들|둥글|알|가늘|낯설|드물|서툴|거칠)게/;
 
 /** 서울역 → 서울력, 부산역에서 → 부산녁에서: ㄴ is added before 역 after a place name (two or more syllables). */
 function stationN(word: Syl[]) {
@@ -106,19 +112,31 @@ const MATTER = /^일(?:이|은|을|도|로|만|이야|이에요|이지|인데|�
  * Sound changes that carry across a single space in connected speech:
  * 못 해 → 모 태, 밥 먹어 → 밤 머거, 꼭 해 → 꼬 캐.
  */
-function joinWords(a: Syl, b: Syl, prevWord = '', nextWord = '') {
-  if (!a.f) return;
+// Vowels a final may carry over to across a space (standard pronunciation §15: 밭 아래 → 바다래, 꽃 위 → 꼬뒤);
+// before 이/야/여/요/유 the words stay apart (or take an ㄴ, §29), so they are left alone.
+const CARRY_VOWELS = new Set(['ㅏ', 'ㅐ', 'ㅓ', 'ㅔ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅡ']);
+
+/** Sound changes across one space; true when a consonant moved over (it is then voiced like any between vowels). */
+function joinWords(a: Syl, b: Syl, prevWord = '', nextWord = ''): boolean {
+  if (!a.f) return false;
   if ((a.f === 'ㄴ' || a.f === 'ㄹ') && MATTER.test(nextWord)) {
     b.i = a.f;
-    return;
+    return false;
   }
   if (prevWord.endsWith('못') && nextWord.startsWith('잊')) b.i = 'ㄴ';
+  const n = NEUTRAL[a.f];
+  // A stop carries over to a following vowel as its plain sound: 밥 안 → 바 반, 못 알아들어 → 모 다라드러.
+  if (b.i === 'ㅇ' && CARRY_VOWELS.has(b.m) && (n === 'ㄱ' || n === 'ㄷ' || n === 'ㅂ')) {
+    b.i = n;
+    a.f = '';
+    return true;
+  }
   if (b.i === 'ㅎ') {
     aspirateInto(a, b);
-    return;
+    return false;
   }
-  const n = NEUTRAL[a.f];
   if ((b.i === 'ㄴ' || b.i === 'ㅁ') && NASAL[n]) a.f = NASAL[n];
+  return false;
 }
 
 const isSyl = (x: Syl | undefined, i: string, m: string, f = '') => !!x && x.i === i && x.m === m && x.f === f;
@@ -136,7 +154,7 @@ function futureTense(s: Syl[], k: number): boolean {
 }
 
 /** Applies the sound changes between neighbouring syllables of one word. */
-export function pronounceKorean(word: Syl[]): Syl[] {
+export function pronounceKorean(word: Syl[], softGe = false): Syl[] {
   const s = word.map((x) => ({ ...x }));
   for (let k = 0; k < s.length - 1; k++) {
     const a = s[k];
@@ -183,7 +201,7 @@ export function pronounceKorean(word: Syl[]): Syl[] {
     else if (n === 'ㄹ' && b.i === 'ㄴ') b.i = 'ㄹ';
     // Tensing after an obstruent (학교 → 학꾜)
     if ((n === 'ㄱ' || n === 'ㄷ' || n === 'ㅂ') && TENSE[b.i]) b.i = TENSE[b.i];
-    else if (n === 'ㄹ' && futureTense(s, k)) b.i = 'ㄲ';
+    else if (n === 'ㄹ' && !softGe && futureTense(s, k)) b.i = 'ㄲ';
     a.f = n;
   }
   const last = s[s.length - 1];
@@ -284,11 +302,11 @@ function syllableKana(row: string, medial: string): string {
 
 const JAMO_READ: Record<string, string> = { ㅋ: 'ク', ㅎ: 'フ' };
 
-function wordKana(word: Syl[]): string {
+function wordKana(word: Syl[], softGe = false, carried = false): string {
   let out = '';
   let prevFinal = '';
-  pronounceKorean(word).forEach((syl, k) => {
-    const voiced = k > 0 && (prevFinal === '' || prevFinal === 'ㄴ' || prevFinal === 'ㄹ' || prevFinal === 'ㅁ' || prevFinal === 'ㅇ');
+  pronounceKorean(word, softGe).forEach((syl, k) => {
+    const voiced = (k > 0 || carried) && (prevFinal === '' || prevFinal === 'ㄴ' || prevFinal === 'ㄹ' || prevFinal === 'ㅁ' || prevFinal === 'ㅇ');
     const { row, tense } = consonantRow(syl.i, voiced);
     // A tense consonant gets a small ッ, unless a final consonant already closed the syllable.
     if (tense && k > 0 && !prevFinal) out += 'ッ';
@@ -316,8 +334,9 @@ export function koreanToKatakana(text: string): string {
       stationN(syllables);
       return syllables;
     });
-    for (let w = 0; w + 1 < sounds.length; w++) joinWords(sounds[w][sounds[w].length - 1], sounds[w + 1][0], phrase[w], phrase[w + 1]);
-    out += sounds.map(wordKana).join(' ');
+    const carried = sounds.map(() => false);
+    for (let w = 0; w + 1 < sounds.length; w++) carried[w + 1] = joinWords(sounds[w][sounds[w].length - 1], sounds[w + 1][0], phrase[w], phrase[w + 1]);
+    out += sounds.map((w, k) => wordKana(w, SOFT_GE.test(phrase[k]), carried[k])).join(' ');
     phrase = [];
   };
   const chars = [...text];
@@ -393,7 +412,7 @@ const LONG_VOWEL: Record<number, string> = { 0: '아', 2: '아', 9: '아', 8: '�
 const longVowelOf = (syllable: string) => LONG_VOWEL[Math.floor(((syllable.charCodeAt(0) - HANGUL_BASE) % 588) / 28)] || '';
 
 // Japanese punctuation reads oddly between hangul.
-const JA_PUNCT: Record<string, string> = { '、': ',', '。': '.', '！': '!', '？': '?', '　': ' ' };
+const JA_PUNCT: Record<string, string> = { '、': ', ', '。': '. ', '！': '! ', '？': '? ', '　': ' ' };
 
 // Korean words that Japanese writes in kana read best as the original (オッパ → 오빠, not 옵파).
 const BORROWED: [RegExp, string][] = [
@@ -441,7 +460,8 @@ export function kanaToHangul(kana: string): string {
       pendingN = false;
     }
     if (pendingTsu) {
-      if (syllable) closeLast(geminateFinal(ch));
+      // Before a sound it doubles the next consonant; before a pause it is a short stop (えっ → 엣).
+      closeLast(syllable ? geminateFinal(ch) : F_S);
       pendingTsu = false;
     }
     // A Korean reader stretches a vowel by writing it twice; ー between hangul reads as a dash.
@@ -458,6 +478,7 @@ export function kanaToHangul(kana: string): string {
     if (lastIsSyllable()) closeLast(F_N);
     else out.push('ㄴ');
   }
+  if (pendingTsu) closeLast(F_S);
   return BORROWED.reduce((text, [from, to]) => text.replace(from, to), out.join(''))
     .replace(/[ｗw]+/g, (run) => (run.length > 1 ? 'ㅋㅋ' : 'ㅋ'))
     .replace(/\s+/g, ' ')

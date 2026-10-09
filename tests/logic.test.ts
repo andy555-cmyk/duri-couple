@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { dictKeys, errorKey, makeT } from '../src/lib/i18n';
 import {
+  cleanIn,
   cleanReading,
   looksLike,
   stripFurigana,
@@ -242,6 +243,16 @@ describe('catching wrong-language answers (real Gemini mistakes, 2026-10-02)', (
     expect(validateWrite({ ...bad, lines: [line, line, line] }, andy)).toBeNull();
     expect(validateWrite({ ...bad, lines: [line] }, andy)).toBe('lines');
     expect(validateWrite({ ...bad, said: '7時に終わる', lines: [line, line, line] }, andy)).toBe('said');
+  });
+  it('does not throw away good answers (Codex review3 false positives)', () => {
+    expect(cleanIn('「사랑해」って言って', 'ja')).toBe(true);
+    expect(cleanIn('‘好き’라고 말해 줘', 'ko')).toBe(true);
+    expect(cleanIn('ｗｗ', 'ja')).toBe(true);
+    expect(cleanIn('😭', 'ko')).toBe(true);
+    expect(cleanIn('「사랑해」', 'ja')).toBe(false);
+    expect(worthAlt('会いたいよ', '会いたいな', '보고 싶어')).toBe(true);
+    expect(worthAlt('전화할래?', '통화할래?', '電話する？')).toBe(true);
+    expect(inferGenders({ ...andy, partnerCalls: '오빠/누나', meCalls: '' })).toEqual({ me: '', partner: '' });
   });
   it('lets the speaker mix languages but never the translation', () => {
     const base = { heard: true, lang: 'ko' as const, said: '오늘 すごく 피곤해', translation: '今日すごく疲れた', jaKana: '', alt: '', altKana: '', altMeaning: '', altWhy: '', note: '' };

@@ -23,6 +23,15 @@ export const SETUP_TIMEOUT_MS = 10_000;
 /** Reconnect attempts reset only after the line has proved itself (Codex review2 M2). */
 const STABLE_MS = 30_000;
 const MAX_RECONNECTS = 4;
+/** 0.4 s from before an utterance goes with it, so its first syllable is not lost. */
+const PREROLL_CHUNKS = 4;
+/** At most 30 s of speech is kept while it cannot be sent yet. */
+const MAX_HELD_CHUNKS = 300;
+/** Someone talking over the phone's own voice: this loud (meter scale) for 0.3 s stops the playback. */
+const BARGE_LEVEL = 0.45;
+const BARGE_CHUNKS = 3;
+/** An answer that never arrives must not hold the next speaker for longer than this. */
+const ANSWER_WAIT_MS = 8000;
 
 // The interpreter that currently owns the phone's audio mode; a late stop() of an older one must not
 // switch the session back to playback under a newer one that is recording.
@@ -131,8 +140,15 @@ export class LiveInterpreter {
   private silence = new Int16Array(1600).buffer;
   private timers = new Set<number>();
   private gate: TurnGate;
-  private inTurn = false;
-  private preroll: ArrayBuffer[] = [];
+  // Turn-taking (see feed): 'talking' streams an utterance, 'waiting' means its translation is on the way.
+  private phase: 'idle' | 'talking' | 'waiting' = 'idle';
+  private ring: ArrayBuffer[] = [];
+  private recentReal: ArrayBuffer[] = [];
+  private current: ArrayBuffer[] = [];
+  private pending: { chunks: ArrayBuffer[]; ended: boolean } | null = null;
+  private loudRun = 0;
+  private waitTimer?: number;
+  private leaving = false;
   speak: boolean;
 
   constructor(
@@ -222,6 +238,11 @@ export class LiveInterpreter {
     this.ready = false;
     for (const id of this.timers) clearTimeout(id);
     this.timers.clear();
+    this.phase = 'idle';
+    this.pending = null;
+    this.current = [];
+    this.ring = [];
+    this.leaving = false;
     const ws = this.ws;
     this.ws = undefined;
     try {
@@ -265,31 +286,102 @@ export class LiveInterpreter {
 
   /**
    * One 100 ms mic chunk (PCM16 at 16 kHz and its RMS). The app marks where each utterance starts and
-   * ends; 0.4 s from before the start goes along so the first syllable is not lost.
+   * ends (TurnGate). Nothing said is dropped and no translation is cut off (Codex review3 R1–R3):
+   * - speech that starts while the previous translation is still on its way is held and sent after it;
+   * - an utterance the line never answered (drop, reconnect) is sent again on the new line;
+   * - someone talking loudly over the phone's own voice stops the playback and is heard.
    */
   feed(pcm: ArrayBuffer, rms: number) {
-    // While the phone is speaking a translation, the mic would hear it: treat it as silence.
-    const echo = this.speak && performance.now() < this.quietUntil;
-    const level = echo ? 0 : Math.min(1, rms * 4);
+    const raw = Math.min(1, rms * 4);
+    // While the phone is speaking a translation, the mic would hear it: treat it as silence...
+    let echo = this.speak && performance.now() < this.quietUntil;
+    if (echo) {
+      // ...unless someone close to the phone is clearly talking over it.
+      this.loudRun = raw >= BARGE_LEVEL ? this.loudRun + 1 : 0;
+      if (this.loudRun >= BARGE_CHUNKS) {
+        this.stopPlayback();
+        echo = false;
+        this.ring = this.recentReal.slice(-PREROLL_CHUNKS);
+      }
+    } else this.loudRun = 0;
+    this.recentReal.push(pcm);
+    if (this.recentReal.length > PREROLL_CHUNKS) this.recentReal.shift();
     const chunk = echo ? this.silence : pcm;
+    const level = echo ? 0 : raw;
     this.cb.onLevel?.(level);
     const event = this.gate.feed(level, 100);
-    if (!this.ready) return;
-    if (!this.inTurn) {
-      this.preroll.push(chunk);
-      if (this.preroll.length > 4) this.preroll.shift();
-      if (event !== 'start') return;
-      this.inTurn = true;
-      this.sendJson({ realtimeInput: { activityStart: {} } });
-      for (const piece of this.preroll) this.send(piece);
-      this.preroll = [];
+
+    if (this.ready && this.phase === 'talking') {
+      if (this.current.length < MAX_HELD_CHUNKS) this.current.push(chunk);
+      this.send(chunk);
+      if (event === 'end') this.endTurn();
       return;
     }
-    this.send(chunk);
-    if (event === 'end') {
-      this.inTurn = false;
-      this.sendJson({ realtimeInput: { activityEnd: {} } });
+    // Not streaming right now: keep what is being said until it can go.
+    if (this.pending) {
+      if (this.pending.chunks.length < MAX_HELD_CHUNKS) this.pending.chunks.push(chunk);
+      if (event === 'end') this.pending.ended = true;
+      if (event === 'start') this.pending.ended = false;
+      return;
     }
+    if (event === 'start') {
+      const chunks = [...this.ring, chunk];
+      this.ring = [];
+      if (this.ready && this.phase === 'idle') this.beginTurn(chunks, false);
+      else this.pending = { chunks, ended: false };
+      return;
+    }
+    this.ring.push(chunk);
+    if (this.ring.length > PREROLL_CHUNKS) this.ring.shift();
+  }
+
+  private beginTurn(chunks: ArrayBuffer[], ended: boolean) {
+    this.sendJson({ realtimeInput: { activityStart: {} } });
+    for (const piece of chunks) this.send(piece);
+    this.current = chunks.slice(0, MAX_HELD_CHUNKS);
+    this.phase = 'talking';
+    if (ended) this.endTurn();
+  }
+
+  private endTurn() {
+    this.sendJson({ realtimeInput: { activityEnd: {} } });
+    this.phase = 'waiting';
+    this.cancel(this.waitTimer);
+    this.waitTimer = this.later(() => this.answered(), ANSWER_WAIT_MS);
+  }
+
+  /** The translation of the last utterance is complete (or never came): the next one may go. */
+  private answered() {
+    if (this.phase !== 'waiting') return;
+    this.cancel(this.waitTimer);
+    this.phase = 'idle';
+    this.current = [];
+    if (this.leaving && this.ws) {
+      this.reconnect(this.ws, 0);
+      return;
+    }
+    this.flushPending();
+  }
+
+  private flushPending() {
+    const held = this.pending;
+    if (!held || !this.ready || this.phase !== 'idle') return;
+    this.pending = null;
+    this.beginTurn(held.chunks, held.ended);
+  }
+
+  /** The line is going away: whatever it was given and has not answered is said again on the next one. */
+  private keepUnanswered() {
+    if (this.phase === 'talking' || this.phase === 'waiting') {
+      const sent = this.current;
+      const ended = this.phase === 'waiting' && !this.gate.speaking;
+      this.pending = this.pending
+        ? { chunks: [...sent, ...this.pending.chunks].slice(0, MAX_HELD_CHUNKS), ended: this.pending.ended }
+        : { chunks: sent, ended: ended || (this.phase === 'talking' && !this.gate.speaking) };
+    }
+    this.phase = 'idle';
+    this.current = [];
+    this.cancel(this.waitTimer);
   }
 
   private sendJson(message: unknown) {
@@ -364,20 +456,26 @@ export class LiveInterpreter {
       if (message.setupComplete) {
         setupDone = true;
         this.ready = true;
-        // A fresh line starts between turns; someone still talking is picked up again within 0.2 s.
-        this.gate.reset();
-        this.inTurn = false;
-        this.preroll = [];
+        this.ring = [];
         this.cancel(setupTimer);
         stable = this.later(() => (this.reconnects = 0), STABLE_MS);
         this.cb.onState?.('listening');
+        // Anything said while the line was down goes now.
+        this.flushPending();
         return;
       }
       if (message.goAway) {
-        // The server is about to end this session (time limit): open a fresh one now.
-        ended = true;
-        this.cancel(stable);
-        this.reconnect(ws, 0);
+        // The server will end this session soon (time limit). Switch lines between turns so no
+        // translation is cut: now if nothing is under way, else right after the answer.
+        if (this.phase === 'idle' && !this.pending) {
+          ended = true;
+          this.cancel(stable);
+          this.reconnect(ws, 0);
+          return;
+        }
+        this.leaving = true;
+        const seconds = parseFloat(String(message.goAway.timeLeft || '')) || 5;
+        this.later(() => this.leaving && this.ws === ws && this.reconnect(ws, 0), Math.max(500, seconds * 1000 - 1000));
         return;
       }
       this.handle(message.serverContent, model);
@@ -387,6 +485,8 @@ export class LiveInterpreter {
 
   private reconnect(old: WebSocket, delay: number) {
     if (this.stopped) return;
+    this.leaving = false;
+    this.keepUnanswered();
     if (this.reconnects++ >= MAX_RECONNECTS) {
       this.fail('network');
       return;
@@ -430,6 +530,7 @@ export class LiveInterpreter {
       this.cur = { input: '', output: '' };
       this.cb.onCaption?.({ ...this.cur });
       this.cb.onState?.('listening');
+      this.answered();
     }
   }
 

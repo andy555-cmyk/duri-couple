@@ -85,6 +85,14 @@ for (const [n, lang] of order.entries()) {
   }
   const spokeEnd = Date.now();
   console.log(at(), `sent ${lang} speech`);
+  if (process.env.NO_WAIT && n < order.length - 1) {
+    // The next person starts right after this one (0.8 s), before this translation is done.
+    for (let i = 0; i < 8; i++) {
+      quiet();
+      await sleep(100);
+    }
+    continue;
+  }
   const before = turns.length;
   for (let i = 0; i < 80 && turns.length === before; i++) {
     quiet();
@@ -92,6 +100,13 @@ for (const [n, lang] of order.entries()) {
   }
   const turn = turns[before];
   console.log(turn ? `${lang}: translation ${((turn.at - spokeEnd) / 1000).toFixed(2)}s after speech ended` : `${lang}: no turn`);
+}
+if (process.env.NO_WAIT) {
+  for (let i = 0; i < 100 && turns.length < order.length; i++) {
+    quiet();
+    await sleep(100);
+  }
+  console.log(`turns: ${turns.length} of ${order.length}`);
 }
 await live.stop();
 console.log(at(), 'stopped, state', state);

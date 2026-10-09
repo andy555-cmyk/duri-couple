@@ -167,23 +167,94 @@ describe('real-time interpreting protocol', () => {
   });
   const chunk = (value: number) => new Int16Array(1600).fill(value).buffer;
   const kinds = (ws: FakeWS) => ws.sent.map((m) => (m.realtimeInput?.activityStart ? 'start' : m.realtimeInput?.activityEnd ? 'end' : m.realtimeInput?.audio ? 'audio' : 'other'));
+  const loud = (live: LiveInterpreter, n = 1) => {
+    for (let i = 0; i < n; i++) live.feed(chunk(3000), 0.1);
+  };
+  const hush = (live: LiveInterpreter, n = 1) => {
+    for (let i = 0; i < n; i++) live.feed(chunk(0), 0.002);
+  };
+  const answer = (ws: FakeWS) => ws.emit({ serverContent: { outputTranscription: { text: '응' }, turnComplete: true } });
   it('marks the start and end of each utterance itself, with the moment before it', () => {
     const { live, ws } = session();
     ws().open();
     ws().emit({ setupComplete: {} });
-    for (let i = 0; i < 5; i++) live.feed(chunk(0), 0.002); // quiet: nothing is sent
+    hush(live, 5); // quiet: nothing is sent
     expect(kinds(ws()).filter((k) => k !== 'other')).toEqual([]);
-    live.feed(chunk(3000), 0.1);
-    live.feed(chunk(3000), 0.1); // 0.2 s of voice: a turn starts, with up to 0.4 s from before
-    expect(kinds(ws()).slice(1)).toEqual(['start', 'audio', 'audio', 'audio', 'audio']);
-    for (let i = 0; i < 6; i++) live.feed(chunk(0), 0.002);
+    loud(live, 2); // 0.2 s of voice: a turn starts, with 0.4 s from before
+    expect(kinds(ws()).slice(1)).toEqual(['start', 'audio', 'audio', 'audio', 'audio', 'audio']);
+    hush(live, 6);
     expect(kinds(ws()).at(-1)).toBe('audio');
-    live.feed(chunk(0), 0.002); // 0.7 s of quiet ends it
+    hush(live); // 0.7 s of quiet ends it
     expect(kinds(ws()).at(-1)).toBe('end');
-    // The next utterance is a new turn.
-    live.feed(chunk(3000), 0.1);
-    live.feed(chunk(3000), 0.1);
+    answer(ws());
+    loud(live, 2); // the next utterance is a new turn
     expect(kinds(ws()).filter((k) => k === 'start')).toHaveLength(2);
+  });
+  it('never cuts a translation short: speech during the answer waits for it (Codex review3 R3)', () => {
+    const { live, ws } = session();
+    ws().open();
+    ws().emit({ setupComplete: {} });
+    loud(live, 3);
+    hush(live, 7); // end of the first utterance
+    loud(live, 4); // talking again before the translation arrived
+    expect(kinds(ws()).filter((k) => k === 'start')).toHaveLength(1);
+    const before = kinds(ws()).length;
+    answer(ws());
+    const after = kinds(ws()).slice(before);
+    expect(after[0]).toBe('start');
+    expect(after.filter((k) => k === 'audio').length).toBe(4); // all four chunks said meanwhile, none lost
+    hush(live, 7);
+    expect(kinds(ws()).at(-1)).toBe('end');
+  });
+  it('lets the next speaker go if an answer never comes', () => {
+    const { live, ws } = session();
+    ws().open();
+    ws().emit({ setupComplete: {} });
+    loud(live, 3);
+    hush(live, 7);
+    loud(live, 3);
+    expect(kinds(ws()).filter((k) => k === 'start')).toHaveLength(1);
+    vi.advanceTimersByTime(8000);
+    expect(kinds(ws()).filter((k) => k === 'start')).toHaveLength(2);
+  });
+  it('says an unanswered utterance again on the new line after a drop (Codex review3 R1)', () => {
+    const { live, ws } = session();
+    ws().open();
+    ws().emit({ setupComplete: {} });
+    loud(live, 6);
+    const spoken = kinds(ws()).filter((k) => k === 'audio').length;
+    ws().close(1006, '');
+    loud(live, 3); // still talking while the line is down
+    hush(live, 7);
+    vi.advanceTimersByTime(1000);
+    ws().open();
+    ws().emit({ setupComplete: {} });
+    const resent = kinds(ws());
+    expect(resent.slice(1, 2)).toEqual(['start']);
+    expect(resent.filter((k) => k === 'audio').length).toBeGreaterThanOrEqual(spoken + 3);
+    expect(resent.at(-1)).toBe('end');
+  });
+  it('switches lines between turns when the server is about to close', () => {
+    const { live, ws } = session();
+    ws().open();
+    ws().emit({ setupComplete: {} });
+    loud(live, 3);
+    hush(live, 7); // waiting for the translation
+    ws().emit({ goAway: { timeLeft: '10s' } });
+    expect(FakeWS.all).toHaveLength(1); // not while the answer is on its way
+    answer(ws());
+    vi.advanceTimersByTime(1);
+    expect(FakeWS.all).toHaveLength(2);
+  });
+  it('hears someone talking loudly over the phone\'s own voice (Codex review3 R2)', () => {
+    const { live, ws } = session();
+    ws().open();
+    ws().emit({ setupComplete: {} });
+    (live as any).speak = true;
+    (live as any).quietUntil = performance.now() + 5000;
+    for (let i = 0; i < 5; i++) live.feed(chunk(9000), 0.2); // clearly louder than an echo
+    expect(kinds(ws())).toContain('start');
+    expect((live as any).quietUntil).toBe(0);
   });
   it('does not take its own translated voice for someone talking', () => {
     const { live, ws } = session();
@@ -200,21 +271,6 @@ describe('real-time interpreting protocol', () => {
     ws().emit({ setupComplete: {} });
     for (let i = 0; i < 205; i++) live.feed(chunk(3000), 0.1);
     expect(kinds(ws())).toContain('end');
-  });
-  it('starts a fresh turn after a reconnect instead of continuing a lost one', () => {
-    const { live, ws } = session();
-    ws().open();
-    ws().emit({ setupComplete: {} });
-    live.feed(chunk(3000), 0.1);
-    live.feed(chunk(3000), 0.1);
-    ws().close(1006, '');
-    vi.advanceTimersByTime(1000);
-    ws().open();
-    ws().emit({ setupComplete: {} });
-    live.feed(chunk(3000), 0.1);
-    expect(kinds(ws())).not.toContain('start');
-    live.feed(chunk(3000), 0.1);
-    expect(kinds(ws()).slice(1, 2)).toEqual(['start']);
   });
   it('classifies close reasons', () => {
     expect(classifyClose(1008, 'API key not valid')).toBe('key');
