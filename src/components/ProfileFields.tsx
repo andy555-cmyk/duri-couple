@@ -1,5 +1,22 @@
-import type { Lang, Profile } from '../lib/types';
+import type { Gender, Lang, Profile } from '../lib/types';
 import { useApp } from './AppContext';
+
+/** Tapping the chosen option again clears it. */
+function GenderRow({ label, value, onPick }: { label: string; value: Gender; onPick: (g: Gender) => void }) {
+  const { t } = useApp();
+  return (
+    <div className="field-row">
+      <span>{label}</span>
+      <div className="segmented small" role="group" aria-label={label}>
+        {(['m', 'f'] as const).map((g) => (
+          <button key={g} className={value === g ? 'on' : ''} aria-pressed={value === g} onClick={() => onPick(value === g ? '' : g)}>
+            {t(g === 'm' ? 'p.male' : 'p.female')}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function ProfileFields({ value, onChange, showLang = true }: { value: Profile; onChange: (p: Profile) => void; showLang?: boolean }) {
   const { t } = useApp();
@@ -38,6 +55,9 @@ export function ProfileFields({ value, onChange, showLang = true }: { value: Pro
         <span>{t('p.partnerCalls')}</span>
         <input className="field" value={value.partnerCalls} placeholder={t('p.calledPh')} onChange={(event) => set({ partnerCalls: event.target.value })} />
       </label>
+      <GenderRow label={t('p.meGender')} value={value.meGender} onPick={(meGender) => set({ meGender })} />
+      <GenderRow label={t('p.partnerGender')} value={value.partnerGender} onPick={(partnerGender) => set({ partnerGender })} />
+      <p className="field-help">{t('p.genderHelp')}</p>
       <div className="field-row">
         <span>{t('p.style')}</span>
         <div className="segmented small">

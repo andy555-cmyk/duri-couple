@@ -86,7 +86,10 @@ export class SpeechGate {
         return 'end';
       }
     } else {
-      this.voiced = Math.max(0, this.voiced - dt * 0.5);
+      // Separate bumps or clicks must not add up to "speech": a fifth of a second of quiet starts over
+      // (Codex review2 M5). Gaps between syllables are shorter than that.
+      this.quiet += dt;
+      this.voiced = this.quiet >= 200 ? 0 : Math.max(0, this.voiced - dt * 0.5);
       if (this.elapsed >= this.idleMs) {
         this.fired = true;
         return 'nothing';
@@ -96,9 +99,69 @@ export class SpeechGate {
   }
 }
 
+/**
+ * Continuous turn detection for real-time interpreting: 'start' when someone begins talking, 'end'
+ * after `endMs` of quiet (or after `maxMs` of talking, so a long story still gets translated).
+ *
+ * Measured 2026-10-10 against the real Live API (tools/live-ws-check.mjs, duri-lab/live/manual-vad.mjs):
+ * Google's own end-of-speech detection cut the second sentence of a session after a few words and
+ * dropped the rest (2 of 3 runs with a 1 s setting, 3 of 3 with 2 s). With the app marking each turn
+ * itself, three turns in a row came back whole, first words 0.8–1.1 s after the end mark.
+ */
+export class TurnGate {
+  floor = 0.04;
+  speaking = false;
+  private voiced = 0;
+  private quiet = 0;
+  private talked = 0;
+
+  constructor(
+    private endMs = 700,
+    private maxMs = 20000,
+  ) {}
+
+  get threshold() {
+    return Math.max(0.12, this.floor * 3);
+  }
+
+  reset() {
+    this.speaking = false;
+    this.voiced = 0;
+    this.quiet = 0;
+    this.talked = 0;
+  }
+
+  feed(level: number, dt: number): 'start' | 'end' | 'none' {
+    const loud = level > this.threshold;
+    if (!this.speaking) {
+      if (loud) {
+        this.voiced += dt;
+        this.quiet = 0;
+        if (this.voiced < 200) return 'none';
+        this.speaking = true;
+        this.talked = this.voiced;
+        this.voiced = 0;
+        return 'start';
+      }
+      // Only the quiet between turns teaches the noise floor; a short gap means the bump was noise.
+      this.floor = this.floor * 0.97 + level * 0.03;
+      this.quiet += dt;
+      if (this.quiet >= 200) this.voiced = 0;
+      return 'none';
+    }
+    this.talked += dt;
+    this.quiet = loud ? 0 : this.quiet + dt;
+    if (this.quiet < this.endMs && this.talked < this.maxMs) return 'none';
+    this.reset();
+    return 'end';
+  }
+}
+
 export interface RecorderOptions {
   onLevel?: (level: number) => void;
   onAutoStop?: () => void;
+  /** The browser ended the recording on its own (iOS does this when the app goes to the background). */
+  onBroken?: () => void;
   /** Stop by itself once the speaker goes quiet. */
   autoEnd?: boolean;
   silenceMs?: number;
@@ -177,7 +240,11 @@ export class Recorder {
         finishOnce({ blob, mime: type.split(';')[0] || 'audio/mp4', ms: Date.now() - this.started, heardSpeech: this.gate ? this.gate.heard : null });
       };
       // Safari can report an error instead of stopping (e.g. when sent to the background).
-      this.recorder.onerror = () => finishOnce(null);
+      this.recorder.onerror = () => {
+        const waiting = !!this.finish;
+        finishOnce(null);
+        if (!waiting) this.opts.onBroken?.();
+      };
       this.started = Date.now();
       this.recorder.start();
     } catch {

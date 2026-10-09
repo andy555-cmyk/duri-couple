@@ -1701,6 +1701,13 @@ code,
   justify-content: space-between;
   gap: 10px;
 }
+.field-help {
+  margin: -6px 0 2px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+  text-wrap: pretty;
+}
 .field {
   width: 100%;
   border: 1px solid var(--line);

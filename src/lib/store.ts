@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { GlossaryItem, Lang, Phrase, Profile, Settings, Turn } from './types';
+import type { Gender, GlossaryItem, Lang, Phrase, Profile, Settings, Turn } from './types';
 import { other } from './types';
 
 export const KEYS = {
@@ -19,7 +19,11 @@ export const DEFAULT_PROFILE: Profile = {
   meCalls: '',
   partnerCalls: '',
   style: 'casual',
+  meGender: '',
+  partnerGender: '',
 };
+
+export const gender = (v: unknown): Gender => (v === 'm' || v === 'f' ? v : '');
 
 export const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
@@ -96,21 +100,39 @@ export function useSession<T>(key: string, fallback: T): [T, (next: T) => void] 
     }
   });
   const timer = useRef(0);
+  const pending = useRef<{ value: T } | null>(null);
+  const flush = useCallback(() => {
+    clearTimeout(timer.current);
+    const next = pending.current;
+    pending.current = null;
+    if (!next) return;
+    try {
+      sessionStorage.setItem(key, JSON.stringify(next.value));
+    } catch {
+      /* private mode */
+    }
+  }, [key]);
   const update = useCallback(
     (next: T) => {
       setValue(next);
       // Typing would otherwise write on every keystroke (Codex review S5).
+      pending.current = { value: next };
       clearTimeout(timer.current);
-      timer.current = window.setTimeout(() => {
-        try {
-          sessionStorage.setItem(key, JSON.stringify(next));
-        } catch {
-          /* private mode */
-        }
-      }, 250);
+      timer.current = window.setTimeout(flush, 250);
     },
-    [key],
+    [flush],
   );
+  // The last quarter second of typing must survive iOS freezing the tab right after an app switch (Codex review2 M9).
+  useEffect(() => {
+    const onHide = () => document.hidden && flush();
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', onHide);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', onHide);
+      flush();
+    };
+  }, [flush]);
   return [value, update];
 }
 
@@ -160,6 +182,8 @@ export interface SharePayload {
   fromCalls: string;
   toCalls: string;
   style: Profile['style'];
+  fromGender?: Gender;
+  toGender?: Gender;
   glossary: { ko: string; ja: string; note?: string }[];
 }
 
@@ -187,6 +211,8 @@ export function makeShareLink(profile: Profile, glossary: GlossaryItem[], base: 
     fromCalls: profile.meCalls,
     toCalls: profile.partnerCalls,
     style: profile.style,
+    ...(profile.meGender ? { fromGender: profile.meGender } : {}),
+    ...(profile.partnerGender ? { toGender: profile.partnerGender } : {}),
     glossary: glossary.slice(0, SHARE_GLOSSARY_LIMIT).map(({ ko, ja, note }) => ({ ko, ja, ...(note ? { note } : {}) })),
   };
   return `${base}#join=${toBase64Url(JSON.stringify(payload))}`;
@@ -215,6 +241,8 @@ export function readShareHash(hash: string): SharePayload | null {
       fromCalls: text(raw.fromCalls),
       toCalls: text(raw.toCalls),
       style: raw.style === 'polite' ? 'polite' : 'casual',
+      fromGender: gender(raw.fromGender),
+      toGender: gender(raw.toGender),
       glossary,
     };
   } catch {
@@ -233,6 +261,8 @@ export function profileFromShare(payload: SharePayload, current: Profile): Profi
     meCalls: current.meCalls || payload.toCalls || '',
     partnerCalls: current.partnerCalls || payload.fromCalls || '',
     style: payload.style || current.style,
+    meGender: current.meGender || payload.toGender || '',
+    partnerGender: current.partnerGender || payload.fromGender || '',
   };
 }
 
@@ -275,6 +305,8 @@ export function parseBackup(text: string): Backup {
   for (const key of ['myName', 'partnerName', 'startDate', 'meCalls', 'partnerCalls'] as const) profile[key] = text_(profile[key]);
   if (profile.myLang !== 'ko' && profile.myLang !== 'ja') profile.myLang = 'ko';
   if (profile.style !== 'polite') profile.style = 'casual';
+  profile.meGender = gender(profile.meGender);
+  profile.partnerGender = gender(profile.partnerGender);
   return {
     app: 'duri-couple',
     v: 2,

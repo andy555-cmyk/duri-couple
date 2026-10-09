@@ -153,6 +153,18 @@ export function usableModels(now = Date.now(), health = readHealth(), rate = rea
   return ready.length ? ready : orderedModels(now, health, rate).slice(0, 1);
 }
 
+/**
+ * When every model is resting after Google answered "too many requests", how long until the first is
+ * free again (ms); 0 when something can be tried. Asking again early only earns another 429
+ * (Codex review2 M3).
+ */
+export function quotaWait(now = Date.now(), health = readHealth()): number {
+  const rests = MODELS.map((m) => health[m.id]).filter((h) => (h?.skipUntil || 0) > now);
+  if (rests.length < MODELS.length) return 0;
+  const soonest = rests.reduce((a, b) => ((a!.skipUntil || 0) <= (b!.skipUntil || 0) ? a : b))!;
+  return soonest.reason === '429' ? (soonest.skipUntil || 0) - now : 0;
+}
+
 export function buildBody(opts: {
   system: string;
   parts: Part[];
@@ -488,8 +500,13 @@ export function callGemini<T = any>(opts: CallOptions<T>): Promise<CallResult<T>
   const timeoutMs = opts.timeoutMs ?? 25000;
   const deadline = Date.now() + (opts.budgetMs ?? Math.max(45000, timeoutMs * 1.6));
   const hedgeMs = opts.hedgeMs ?? 0;
+  if (!opts.models) {
+    const wait = quotaWait();
+    if (wait > 0) return Promise.reject(new GeminiError('quota', 429, `all models resting for ${Math.ceil(wait / 1000)}s`));
+  }
   // One tap never fans out over every model: only usable ones, at most maxModels (Codex review S1).
   const queue = (opts.models || usableModels()).slice(0, opts.maxModels ?? 3);
+  let launched = 0;
   const errors: GeminiError[] = [];
   let fallback: CallResult<T> | null = null;
   const running = new Map<AbortController, string>();
@@ -524,7 +541,10 @@ export function callGemini<T = any>(opts: CallOptions<T>): Promise<CallResult<T>
       }
       const controller = new AbortController();
       running.set(controller, spec.id);
-      const hedge = hedgeMs > 0 ? setTimeout(() => !leader && running.has(controller) && running.size < 2 && launch(), hedgeMs) : 0;
+      // Only the first model gets company; later ones are plain fallbacks, so one tap costs at most
+      // two calls unless both fail (Codex review2 H3).
+      const hedge =
+        hedgeMs > 0 && launched++ === 0 ? setTimeout(() => !leader && running.has(controller) && running.size < 2 && launch(), hedgeMs) : 0;
       const becomeLeader = () => {
         clearTimeout(hedge);
         if (leader) return;
@@ -549,8 +569,8 @@ export function callGemini<T = any>(opts: CallOptions<T>): Promise<CallResult<T>
           leader = null;
           opts.onReset?.();
         }
-        if (running.size === 0 || queue.length) launch();
-        if (!running.size && !queue.length) giveUp();
+        // The next model waits until nothing else is in flight; launch() gives up when the queue is empty.
+        if (running.size === 0) launch();
       });
     };
     launch();

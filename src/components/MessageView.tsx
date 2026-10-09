@@ -11,11 +11,12 @@ import {
   writePrompt,
   WRITE_SCHEMA,
   looksLike,
+  readingFor,
   type UnderstandJson,
   type WriteJson,
 } from '../lib/prompts';
 import { uid, useSession } from '../lib/store';
-import type { Tone, Turn } from '../lib/types';
+import type { Lang, Tone, Turn } from '../lib/types';
 import { useApp } from './AppContext';
 import { Icon } from './Icon';
 import { LineCard, SpeakButtons, textIn } from './TurnCard';
@@ -372,7 +373,7 @@ function LiveUnderstand({ live }: { live: { value: Record<string, any>; open: st
                 <p className="line-text" lang={their}>
                   {r.text}
                 </p>
-                {r.reading && <p className="reading">{r.reading}</p>}
+                <Reading text={String(r.text)} lang={their} kana={r.kana} />
                 {r.meaning && <p className="line-meaning">{r.meaning}</p>}
               </div>
             ))}
@@ -381,6 +382,12 @@ function LiveUnderstand({ live }: { live: { value: Record<string, any>; open: st
       )}
     </article>
   );
+}
+
+/** Pronunciation under a line that is still arriving: Korean by rule, Japanese from the model's kana. */
+function Reading({ text, lang, kana }: { text: string; lang: Lang; kana?: unknown }) {
+  const reading = readingFor(text, lang, typeof kana === 'string' ? kana : undefined);
+  return reading ? <p className="reading">{reading}</p> : null;
 }
 
 /** The three outgoing options as each one fills in. */
@@ -403,7 +410,7 @@ function LiveWrite({ live }: { live: { value: Record<string, any>; open: string 
             {l.text}
             {i === lines.length - 1 && live.open === 'lines' && <Caret />}
           </p>
-          {l.reading && <p className="reading">{l.reading}</p>}
+          <Reading text={String(l.text)} lang={their} kana={l.kana} />
           {l.meaning && <p className="line-meaning">{l.meaning}</p>}
         </div>
       ))}

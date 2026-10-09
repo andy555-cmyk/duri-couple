@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { blobToBase64, callGemini, failureOf, GeminiError } from '../lib/gemini';
 import {
   DAILY_SCHEMA,
@@ -417,15 +417,21 @@ function AddPhraseSheet({ onClose }: { onClose: () => void }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ text: string; kind: string } | null>(null);
+  // A second tap before the first re-render must not send twice; closing the sheet cancels (Codex review B1/B2).
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), []);
 
   async function add() {
     const clean = text.trim();
-    if (!clean || busy) return;
+    if (!clean || busy || request.current) return;
     if (!app.settings.apiKey) return setError({ text: t('err.nokey'), kind: 'nokey' });
+    const controller = new AbortController();
+    request.current = controller;
     setBusy(true);
     setError(null);
     try {
       const result = await callGemini<TalkJson>({
+        signal: controller.signal,
         key: app.settings.apiKey,
         system: systemPrompt(app.profile, app.glossary),
         parts: [{ text: talkPrompt({ profile: app.profile, turns: [], tone: app.settings.tone, text: clean }) }],
@@ -439,8 +445,10 @@ function AddPhraseSheet({ onClose }: { onClose: () => void }) {
       app.toast(t('toast.saved'));
       onClose();
     } catch (caught) {
+      if (controller.signal.aborted) return;
       setError({ text: app.errorText(caught), kind: caught instanceof GeminiError ? caught.kind : '' });
     } finally {
+      if (request.current === controller) request.current = null;
       setBusy(false);
     }
   }

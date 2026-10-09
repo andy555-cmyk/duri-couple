@@ -10,12 +10,15 @@ import {
   validateWrite,
   contextLines,
   daysTogether,
+  inferGenders,
+  livePrompt,
   systemPrompt,
   TALK_SCHEMA,
   talkPrompt,
   turnFromTalk,
   turnFromUnderstand,
   turnFromWrite,
+  worthAlt,
 } from '../src/lib/prompts';
 import { DEFAULT_PROFILE, grade, makeShareLink, mergeById, mergeGlossary, parseBackup, phraseFrom, profileFromShare, readShareHash } from '../src/lib/store';
 import type { Profile, Turn } from '../src/lib/types';
@@ -57,6 +60,28 @@ describe('prompts', () => {
     expect(system).toContain('- 우리 라멘집 = いつものラーメン屋 (단골)');
     expect(system).toContain('반말');
   });
+  it('speaks in each person\'s own voice', () => {
+    const set = systemPrompt({ ...andy, meGender: 'm', partnerGender: 'f' }, []);
+    expect(set).toContain('Andy: native Korean speaker, a man');
+    expect(set).toContain('시오리: native Japanese speaker, a woman');
+    expect(set).toContain('俺 or 僕');
+    expect(set).not.toContain('infer it from terms of address');
+    // Not set, but she calls him オッパ: that settles both.
+    const inferred = systemPrompt(andy, []);
+    expect(inferred).toContain('Andy: native Korean speaker, a man');
+    expect(inferred).toContain('시오리: native Japanese speaker, a woman');
+    expect(inferGenders({ ...andy, partnerCalls: '', meCalls: '누나' })).toEqual({ me: 'm', partner: 'f' });
+    expect(inferGenders({ ...andy, partnerCalls: '준형', meCalls: '' })).toEqual({ me: '', partner: '' });
+    // Nothing to go on: the model is told how to read such terms instead of guessing.
+    const unset = systemPrompt({ ...andy, partnerCalls: '앤디', meCalls: '시오리' }, []);
+    expect(unset).toContain('Andy: native Korean speaker, learning');
+    expect(unset).toContain('오빠/オッパ: a woman calling a man');
+    // The same Japanese speaker seen from her own phone.
+    const hers = systemPrompt({ ...DEFAULT_PROFILE, myLang: 'ja', myName: 'しおり', partnerName: 'Andy', meGender: 'f', partnerGender: 'm' }, []);
+    expect(hers).toContain('Andy: native Korean speaker, a man');
+    expect(livePrompt({ ...andy, meGender: 'm', partnerGender: 'f' }, [])).toContain('Andy is a man and 시오리 is a woman');
+    expect(livePrompt({ ...andy, partnerCalls: '앤디' }, [])).not.toContain('is a man');
+  });
   it('lists every schema key in the prompt so lite mode still works', () => {
     const prompt = talkPrompt({ profile: andy, turns: [], tone: 'sweet', text: '보고 싶어' });
     for (const key of TALK_SCHEMA.required) expect(prompt).toContain(`- ${key}:`);
@@ -73,38 +98,59 @@ describe('prompts', () => {
 });
 
 describe('turn mapping', () => {
-  it('maps a Korean utterance', () => {
+  it('maps a Korean utterance; the Korean reading comes from code, the Japanese one from kana', () => {
     const turn = turnFromTalk(
-      { heard: true, lang: 'ko', said: '보고 싶었어', translation: '会いたかった', koKana: 'ポゴ シポッソ', jaHangul: '아이타캇타', alt: 'ずっと会いたかった', altReading: '즛토 아이타캇타', altMeaning: '계속 보고 싶었어', altWhy: '더 애틋해요', note: '' },
+      { heard: true, lang: 'ko', said: '보고 싶었어', translation: '会いたかった', jaKana: 'あいたかった', alt: 'ずっと会いたかった', altKana: 'ずっと あいたかった', altMeaning: '계속 보고 싶었어', altWhy: '더 애틋해요', note: '' },
       meta,
     );
     expect(turn).toMatchObject({ lang: 'ko', ko: '보고 싶었어', ja: '会いたかった', koKana: 'ポゴ シポッソ', jaHangul: '아이타캇타' });
-    expect(turn.alt?.text).toBe('ずっと会いたかった');
+    expect(turn.alt).toMatchObject({ text: 'ずっと会いたかった', reading: '즛토 아이타캇타' });
     expect(turn.note).toBeUndefined();
   });
-  it('maps a Japanese utterance and drops an alt identical to the translation', () => {
+  it('maps a Japanese utterance, tidies chat marks and drops an alt identical to the translation', () => {
     const turn = turnFromTalk(
-      { heard: true, lang: 'ja', said: 'ありがとう', translation: '고마워', koKana: 'コマウォ', jaHangul: '아리가토ー', alt: '고마워!', altReading: '', altMeaning: '', altWhy: '', note: '' },
+      { heard: true, lang: 'ja', said: 'ありがとう（笑）', translation: '고마워', jaKana: 'ありがとー', alt: '고마워!', altKana: '', altMeaning: '', altWhy: '', note: '' },
       meta,
     );
-    expect(turn).toMatchObject({ lang: 'ja', ja: 'ありがとう', ko: '고마워' });
+    expect(turn).toMatchObject({ lang: 'ja', ja: 'ありがとう（笑）', ko: '고마워', koKana: 'コマウォ', jaHangul: '아리가토오' });
     expect(turn.alt).toBeUndefined();
   });
-  it('maps a received message with replies', () => {
+  it('keeps only alternatives that are real alternatives (Codex grading 2026-10-10)', () => {
+    expect(worthAlt('우리 라멘집 오늘 쉬는 날이데😭', '우리 라멘집 오늘 쉬는 날이래😭', '..')).toBe(false);
+    expect(worthAlt('지난번 일, 아직 좀 마음에 걸려', '지난번 일, 아직 좀 신경 쓰여', 'この前のこと、まだ気になる')).toBe(true);
+    expect(worthAlt('会いたくて眠れなくなっちゃった', '会いたくて眠れないよ', '')).toBe(false);
+  });
+  it('turns Korean crying marks inside a Japanese translation into an emoji', () => {
+    const turn = turnFromTalk(
+      { heard: true, lang: 'ko', said: '수고했어ㅠㅠ', translation: 'お疲れ様ㅠㅠ', jaKana: 'おつかれさま', alt: '', altKana: '', altMeaning: '', altWhy: '', note: '' },
+      meta,
+    );
+    expect(turn.ja).toBe('お疲れ様😭');
+  });
+  it('keeps no Japanese reading when the kana is not kana', () => {
+    const turn = turnFromTalk(
+      { heard: true, lang: 'ko', said: '안녕', translation: 'やあ', jaKana: '야', alt: '', altKana: '', altMeaning: '', altWhy: '', note: '' },
+      meta,
+    );
+    expect(turn.jaHangul).toBe('');
+  });
+  it('maps a received message with replies read in the viewer\'s script', () => {
     const turn = turnFromUnderstand(
-      { lang: 'ja', translation: '언제 와?', koKana: '', jaHangul: 'イツ クルノ', nuance: '기다리는 느낌', words: [{ w: 'いつ', r: '이츠', m: '언제' }], replies: [{ text: 'すぐ行く', reading: '스구 이쿠', meaning: '금방 갈게' }] },
+      { lang: 'ja', translation: '언제 와?', jaKana: 'いつ くるの', nuance: '기다리는 느낌', words: [{ w: 'いつ', kana: 'いつ', m: '언제' }], replies: [{ text: 'すぐ行く', kana: 'すぐ いく', meaning: '금방 갈게' }] },
       'いつ来るの？',
       { model: 'm', ms: 1, id: 'x', ts: 1, myLang: 'ko' },
     );
-    expect(turn).toMatchObject({ channel: 'msg-in', ja: 'いつ来るの？', ko: '언제 와?' });
-    expect(turn.lines?.[0].text).toBe('すぐ行く');
+    expect(turn).toMatchObject({ channel: 'msg-in', ja: 'いつ来るの？', ko: '언제 와?', jaHangul: '이츠 쿠루노', koKana: 'オンジェ ワ?' });
+    expect(turn.words?.[0]).toEqual({ w: 'いつ', r: '이츠', m: '언제' });
+    expect(turn.lines?.[0]).toMatchObject({ text: 'すぐ行く', reading: '스구 이쿠' });
   });
   it('maps an outgoing message for a Japanese user', () => {
     const turn = turnFromWrite(
-      { said: '今日はありがとう', lines: [{ label: '基本', text: '오늘 고마워', reading: 'オヌㇽ コマウォ', meaning: '今日ありがとう', why: '' }], myKana: '쿄ー와 아리가토ー', note: '' },
+      { said: '今日はありがとう', saidKana: 'きょーわ ありがとー', lines: [{ label: '基本', text: '오늘 고마워', kana: '', meaning: '今日ありがとう', why: '' }], note: '' },
       { profile: { ...andy, myLang: 'ja' }, input: 'text', model: 'm', ms: 1, id: 'y', ts: 1 },
     );
-    expect(turn).toMatchObject({ lang: 'ja', ja: '今日はありがとう', ko: '오늘 고마워', koKana: 'オヌㇽ コマウォ', jaHangul: '쿄ー와 아리가토ー' });
+    expect(turn).toMatchObject({ lang: 'ja', ja: '今日はありがとう', ko: '오늘 고마워', koKana: 'オヌㇽ コマウォ', jaHangul: '쿄오와 아리가토오' });
+    expect(turn.lines?.[0].reading).toBe('オヌㇽ コマウォ');
   });
 });
 
@@ -117,10 +163,15 @@ describe('store helpers', () => {
     const theirs = profileFromShare(payload!, DEFAULT_PROFILE);
     expect(theirs).toMatchObject({ myLang: 'ja', myName: '시오리', partnerName: 'Andy', meCalls: 'オッパ', partnerCalls: '시오리', startDate: '2026-01-01' });
   });
+  it('carries both genders across a share link, seen from the other side', () => {
+    const link = makeShareLink({ ...andy, meGender: 'm', partnerGender: 'f' }, [], 'https://example.com/duri-couple/');
+    const theirs = profileFromShare(readShareHash(new URL(link).hash)!, DEFAULT_PROFILE);
+    expect(theirs).toMatchObject({ meGender: 'f', partnerGender: 'm' });
+  });
   it('ignores broken links and cleans tampered ones', () => {
     expect(readShareHash('#join=%%%')).toBeNull();
     expect(readShareHash('')).toBeNull();
-    const evil = btoa(JSON.stringify({ v: 1, fromLang: 'ko', fromName: { x: 1 }, startDate: 'soon', style: 'weird', glossary: [{ ko: 'a', ja: 'b' }, 5, { ko: 1 }] }))
+    const evil = btoa(JSON.stringify({ v: 1, fromLang: 'ko', fromName: { x: 1 }, startDate: 'soon', style: 'weird', fromGender: 'x', glossary: [{ ko: 'a', ja: 'b' }, 5, { ko: 1 }] }))
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=+$/, '');
@@ -128,6 +179,7 @@ describe('store helpers', () => {
     expect(p.fromName).toBe('');
     expect(p.startDate).toBe('');
     expect(p.style).toBe('casual');
+    expect(p.fromGender).toBe('');
     expect(p.glossary).toEqual([{ ko: 'a', ja: 'b' }]);
   });
   it('merges dictionaries without duplicates', () => {
@@ -147,12 +199,12 @@ describe('store helpers', () => {
   it('restores backups by merging ids', () => {
     const good = { id: 'a', ts: 2, lang: 'ko', ko: '안녕', ja: 'こんにちは' };
     const backup = parseBackup(
-      JSON.stringify({ app: 'duri-couple', profile: { meCalls: '시오리', style: 'polite', myLang: 'xx' }, turns: [good, { id: 'bad' }, null], phrases: [{ id: 1 }], glossary: 'nope' }),
+      JSON.stringify({ app: 'duri-couple', profile: { meCalls: '시오리', style: 'polite', myLang: 'xx', meGender: 'm', partnerGender: 7 }, turns: [good, { id: 'bad' }, null], phrases: [{ id: 1 }], glossary: 'nope' }),
     );
     expect(backup.turns).toHaveLength(1);
     expect(backup.phrases).toHaveLength(0);
     expect(backup.glossary).toHaveLength(0);
-    expect(backup.profile).toMatchObject({ meCalls: '시오리', style: 'polite', myLang: 'ko' });
+    expect(backup.profile).toMatchObject({ meCalls: '시오리', style: 'polite', myLang: 'ko', meGender: 'm', partnerGender: '' });
     expect(mergeById([{ id: 'b', ts: 1 }], backup.turns as any).map((x: any) => x.id)).toEqual(['b', 'a']);
     expect(() => parseBackup('{"app":"other"}')).toThrow();
   });
@@ -176,25 +228,38 @@ describe('catching wrong-language answers (real Gemini mistakes, 2026-10-02)', (
     expect(stripFurigana('今日(きょう)は本当(ほんとう)にありがとね。来週（らいしゅう）')).toBe('今日は本当にありがとね。来週');
   });
   it('flags replies written in the reader\'s own language', () => {
-    const bad = { lang: 'ja' as const, translation: '오늘 몇 시에 끝나?', koKana: '', jaHangul: '', nuance: '', words: [], replies: [{ text: '나도 시오리 빨리 보고 싶어!', reading: '', meaning: '' }] };
+    const bad = { lang: 'ja' as const, translation: '오늘 몇 시에 끝나?', jaKana: '', nuance: '', words: [], replies: [{ text: '나도 시오리 빨리 보고 싶어!', kana: '', meaning: '' }] };
     expect(validateUnderstand(bad, andy)).toBe('replies');
-    const good = { ...bad, replies: [{ text: '俺も早く会いたい！', reading: '오레모 하야쿠 아이타이!', meaning: '나도 빨리 보고 싶어!' }] };
-    expect(validateUnderstand(good, andy)).toBeNull();
+    const reply = { text: '俺も早く会いたい！', kana: 'おれも はやく あいたい', meaning: '나도 빨리 보고 싶어!' };
+    expect(validateUnderstand({ ...bad, replies: [reply, reply, reply] }, andy)).toBeNull();
+    // Fewer than three replies goes to another model first (Codex review2 M7).
+    expect(validateUnderstand({ ...bad, replies: [reply] }, andy)).toBe('replies');
   });
   it('flags message drafts in the wrong language', () => {
-    const bad = { said: '7시에 끝나', lines: [{ label: '기본', text: '7시에 끝나요', reading: '나나지니 오와루', meaning: '', why: '' }], myKana: '', note: '' };
+    const bad = { said: '7시에 끝나', saidKana: '', lines: [{ label: '기본', text: '7시에 끝나요', kana: '', meaning: '', why: '' }], note: '' };
     expect(validateWrite(bad, andy)).toBe('lines');
-    expect(validateWrite({ ...bad, lines: [{ ...bad.lines[0], text: '7時に終わるよ' }] }, andy)).toBeNull();
+    const line = { ...bad.lines[0], text: '7時に終わるよ' };
+    expect(validateWrite({ ...bad, lines: [line, line, line] }, andy)).toBeNull();
+    expect(validateWrite({ ...bad, lines: [line] }, andy)).toBe('lines');
+    expect(validateWrite({ ...bad, said: '7時に終わる', lines: [line, line, line] }, andy)).toBe('said');
+  });
+  it('lets the speaker mix languages but never the translation', () => {
+    const base = { heard: true, lang: 'ko' as const, said: '오늘 すごく 피곤해', translation: '今日すごく疲れた', jaKana: '', alt: '', altKana: '', altMeaning: '', altWhy: '', note: '' };
+    expect(validateTalk(base)).toBeNull();
+    expect(validateTalk({ ...base, lang: 'ja', said: '今日すごく疲れた', translation: '오늘 本当 피곤해' })).toBe('translation');
+    expect(validateTalk({ ...base, translation: '今日 ㅇㅇ 疲れた' })).toBe('translation');
   });
   it('flags a daily line in the learner\'s own language', () => {
-    expect(validateDaily({ line: '보고 싶었어', meaning: '보고 싶었어', koKana: '', jaHangul: '', note: '' }, andy)).toBe('line');
-    expect(validateDaily({ line: '会いたかった', meaning: '보고 싶었어', koKana: '', jaHangul: '', note: '' }, andy)).toBeNull();
+    expect(validateDaily({ line: '보고 싶었어', meaning: '보고 싶었어', kana: '', note: '' }, andy)).toBe('line');
+    expect(validateDaily({ line: '会いたかった', meaning: '보고 싶었어', kana: 'あいたかった', note: '' }, andy)).toBeNull();
   });
-  it('checks talk answers', () => {
-    const base = { heard: true, lang: 'ko' as const, said: '고마워', translation: 'ありがとう', koKana: 'コマウォ', jaHangul: '아리가토ー', alt: '', altReading: '', altMeaning: '', altWhy: '', note: '' };
+  it('checks talk answers, including stray characters of the other script', () => {
+    const base = { heard: true, lang: 'ko' as const, said: '고마워', translation: 'ありがとう', jaKana: 'ありがとー', alt: '', altKana: '', altMeaning: '', altWhy: '', note: '' };
     expect(validateTalk(base)).toBeNull();
     expect(validateTalk({ ...base, translation: '고마워' })).toBe('translation');
-    expect(validateTalk({ ...base, koKana: '코마워' })).toBe('koKana');
+    expect(validateTalk({ ...base, translation: 'それ まるで シ오리 じゃん' })).toBe('translation');
+    expect(validateTalk({ ...base, translation: '「사랑해」って言って' })).toBeNull();
+    expect(validateTalk({ ...base, translation: 'お疲れ様ㅠㅠ' })).toBeNull();
     expect(validateTalk({ ...base, heard: false, said: '' })).toBeNull();
   });
 });

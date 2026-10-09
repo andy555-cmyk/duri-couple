@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Recording } from '../lib/audio';
 import { blobToBase64, callGemini, failureOf, GeminiError, type Part } from '../lib/gemini';
 import { fieldDone, type Partial } from '../lib/partial';
-import { looksLike, systemPrompt, TALK_SCHEMA, talkPrompt, turnFromTalk, validateTalk, type TalkJson } from '../lib/prompts';
+import { cleanIn, looksLike, systemPrompt, TALK_SCHEMA, talkPrompt, tidyIn, turnFromTalk, validateTalk, type TalkJson } from '../lib/prompts';
 import { speak, stopSpeaking } from '../lib/speech';
 import { uid } from '../lib/store';
 import type { Lang, Turn } from '../lib/types';
@@ -100,10 +100,15 @@ export function useTalk() {
           const translationDone = fieldDone(p, 'translation');
           latest = { said: String(v.said || ''), translation: String(v.translation || ''), lang, translationDone };
           show();
-          // Speak the moment the translation is complete, while readings and suggestions still stream.
-          if (voiced && !spoken && translationDone && lang && v.heard !== false && looksLike(latest.translation, other(lang))) {
-            spoken = latest.translation;
-            speak(spoken, other(lang), 1);
+          // Speak the moment the translation is complete, while readings and suggestions still stream —
+          // but only text that would pass the final check too (Codex review2 H4).
+          if (voiced && !spoken && translationDone && lang && v.heard !== false) {
+            const said = tidyIn(latest.said, lang);
+            const translation = tidyIn(latest.translation, other(lang));
+            if (looksLike(said, lang) && cleanIn(translation, other(lang))) {
+              spoken = translation;
+              speak(spoken, other(lang), 1);
+            }
           }
         },
         onReset: () => {

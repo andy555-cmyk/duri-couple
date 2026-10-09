@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { answerText, buildBody, callGemini, callsLeft, classify, GeminiError, MODELS, orderedModels, parseJsonLoose, parseRetry } from '../src/lib/gemini';
+import { answerText, buildBody, callGemini, callsLeft, classify, GeminiError, MODELS, orderedModels, parseJsonLoose, parseRetry, quotaWait } from '../src/lib/gemini';
 
 const ok = (obj: unknown, extra: Record<string, unknown> = {}) =>
   new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] }, finishReason: 'STOP', ...extra }] }), {
@@ -166,6 +166,24 @@ describe('hedging slow models', () => {
     const result = await callGemini<{ from: string }>({ key: 'k', system: 's', parts: [], models, hedgeMs: 200, fetchImpl: impl });
     expect(result.model).toBe(models[0].id);
   });
+  it('a quick failure does not start a third model while the second is still working', async () => {
+    const asked: string[] = [];
+    const impl = ((url: string, init: RequestInit) => {
+      const model = url.split('/models/')[1].split(':')[0];
+      asked.push(model);
+      const [delay, response] = model === models[0].id ? [100, () => fail(503, 'overloaded')] : [300, () => ok({ from: model })];
+      return new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(response()), delay);
+        init.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    }) as unknown as typeof fetch;
+    const result = await callGemini<{ from: string }>({ key: 'k', system: 's', parts: [], models, hedgeMs: 50, fetchImpl: impl });
+    expect(result.model).toBe(models[1].id);
+    expect(asked).toEqual([models[0].id, models[1].id]);
+  });
   it('can be cancelled by the caller', async () => {
     const { impl } = timedFetch([{ delay: 500, body: {} }]);
     const controller = new AbortController();
@@ -188,6 +206,17 @@ describe('model order and pacing', () => {
     const order = orderedModels(now, {}, { [MODELS[0].id]: used });
     expect(order[0].id).toBe(MODELS[1].id);
     expect(callsLeft(now, { [MODELS[0].id]: used })[MODELS[0].id]).toBe(0);
+  });
+  it('waits instead of asking again when every model is resting after a 429', () => {
+    const now = 1_000_000;
+    const resting = (reason: string, ms: number) => ({ skipUntil: now + ms, reason });
+    const all429 = Object.fromEntries(MODELS.map((m, i) => [m.id, resting('429', 20_000 + i * 1000)]));
+    expect(quotaWait(now, all429)).toBe(20_000);
+    // A model resting for another reason first: just try it.
+    expect(quotaWait(now, { ...all429, [MODELS[3].id]: resting('timeout', 5_000) })).toBe(0);
+    // One model free: no waiting.
+    const { [MODELS[2].id]: _free, ...rest } = all429;
+    expect(quotaWait(now, rest)).toBe(0);
   });
   it('reads Google\'s retry delay and daily limits from a 429', () => {
     const body = {

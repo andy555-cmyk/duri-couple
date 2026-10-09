@@ -32,6 +32,13 @@ describe('knowing when someone has finished talking', () => {
     expect(gate.heard).toBe(false);
     expect(run(gate, 0.02, 3000)).toEqual([]);
   });
+  it('does not add up separate bumps into speech (Codex review2 M5)', () => {
+    const gate = new SpeechGate(1500, 9000);
+    expect([...run(gate, 0.6, 160), ...run(gate, 0.02, 240), ...run(gate, 0.6, 160)]).toEqual([]);
+    // Syllables with short gaps still count.
+    const talk = new SpeechGate(1500, 9000);
+    expect([...run(talk, 0.6, 120), ...run(talk, 0.02, 80), ...run(talk, 0.6, 200)]).toEqual(['speech']);
+  });
   it('gives up when nobody speaks', () => {
     const gate = new SpeechGate(1200, 3000);
     expect(run(gate, 0.03, 3100)).toEqual(['nothing']);

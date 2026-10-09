@@ -1,21 +1,32 @@
 /**
  * Real-time interpreting over the Gemini Live API (WebSocket).
  *
- * Measured 2026-10-09 (duri-lab/live): the general Live model with our couple instructions, a 1 s pause
- * setting and END_SENSITIVITY_LOW translated both directions correctly in casual speech, starting
- * ~1.1 s after the speaker stopped (the record-then-send path needs ~2.5–3 s). The translate-only
- * model is faster on long speech but always answers Korean politely and takes no instructions, so it
- * is not the default.
+ * Measured 2026-10-09 (duri-lab/live): the general Live model with our couple instructions translated
+ * both directions correctly in casual speech (the record-then-send path needs ~2.5–3 s). The
+ * translate-only model is faster on long speech but always answers Korean politely and takes no
+ * instructions, so it is not the default.
+ * 2026-10-10 (tools/live-ws-check.mjs): Google's automatic end-of-speech detection cut the second
+ * sentence of a session short and dropped the rest, so the app marks each turn itself (TurnGate):
+ * every turn came back whole, translation audio starting 1.1–1.4 s after the speaker stopped.
  *
  * Built from Codex's prototype (duri-lab/live/browser-sketch.ts) with: model fallback, reconnects,
  * a level meter, and a half-duplex gate so the phone's own translated voice is never re-translated.
  */
-import { setAudioSession } from './audio';
+import { setAudioSession, TurnGate } from './audio';
 import { runLiveMock } from './mock';
 
 const WS_URL =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 export const LIVE_MODELS = ['gemini-3.8-live', 'gemini-3.1-flash-live-preview'];
+/** A socket that opens but never confirms setup must not keep the mic on (Codex review2 H2). */
+export const SETUP_TIMEOUT_MS = 10_000;
+/** Reconnect attempts reset only after the line has proved itself (Codex review2 M2). */
+const STABLE_MS = 30_000;
+const MAX_RECONNECTS = 4;
+
+// The interpreter that currently owns the phone's audio mode; a late stop() of an older one must not
+// switch the session back to playback under a newer one that is recording.
+let audioOwner: LiveInterpreter | null = null;
 
 export type LiveState = 'idle' | 'connecting' | 'listening' | 'translating' | 'reconnecting' | 'error';
 export type LiveFailure = 'unsupported' | 'denied' | 'key' | 'quota' | 'busy' | 'network';
@@ -37,6 +48,8 @@ export interface LiveConfig {
   system: string;
   speak: boolean;
   models?: string[];
+  /** Quiet that ends a turn (ms); the app marks turns itself (see TurnGate). */
+  endMs?: number;
 }
 
 export function liveSupported() {
@@ -116,6 +129,10 @@ export class LiveInterpreter {
   private playing = new Set<AudioBufferSourceNode>();
   private cur: LiveCaption = { input: '', output: '' };
   private silence = new Int16Array(1600).buffer;
+  private timers = new Set<number>();
+  private gate: TurnGate;
+  private inTurn = false;
+  private preroll: ArrayBuffer[] = [];
   speak: boolean;
 
   constructor(
@@ -123,6 +140,7 @@ export class LiveInterpreter {
     private cb: LiveCallbacks,
   ) {
     this.speak = cfg.speak;
+    this.gate = new TurnGate(cfg.endMs ?? 700);
   }
 
   private get models() {
@@ -134,6 +152,21 @@ export class LiveInterpreter {
   }
 
   private stopMock?: () => void;
+
+  private later(fn: () => void, ms: number) {
+    const id = window.setTimeout(() => {
+      this.timers.delete(id);
+      fn();
+    }, ms);
+    this.timers.add(id);
+    return id;
+  }
+
+  private cancel(id: number | undefined) {
+    if (id === undefined) return;
+    clearTimeout(id);
+    this.timers.delete(id);
+  }
 
   /** Call from inside a tap: iOS only opens sound for an AudioContext created before the first await. */
   async start() {
@@ -147,6 +180,7 @@ export class LiveInterpreter {
       return;
     }
     if (!liveSupported()) throw new Error('unsupported' satisfies LiveFailure);
+    audioOwner = this;
     setAudioSession('play-and-record');
     const AC: typeof AudioContext = window.AudioContext || (window as any).webkitAudioContext;
     this.ctx = new AC();
@@ -186,6 +220,8 @@ export class LiveInterpreter {
     this.stopMock = undefined;
     this.stopped = true;
     this.ready = false;
+    for (const id of this.timers) clearTimeout(id);
+    this.timers.clear();
     const ws = this.ws;
     this.ws = undefined;
     try {
@@ -202,7 +238,10 @@ export class LiveInterpreter {
     this.stopPlayback();
     if (this.ctx && this.ctx.state !== 'closed') await this.ctx.close().catch(() => {});
     this.ctx = undefined;
-    setAudioSession('playback');
+    if (audioOwner === this) {
+      audioOwner = null;
+      setAudioSession('playback');
+    }
     this.cb.onLevel?.(0);
     this.cb.onState?.('idle');
   }
@@ -220,20 +259,47 @@ export class LiveInterpreter {
     // Safari stops a worklet that is not connected to the output, so route it there at zero volume.
     this.sink = ctx.createGain();
     this.sink.gain.value = 0;
-    this.node.port.onmessage = (event: MessageEvent<{ pcm: ArrayBuffer; level: number }>) => {
-      const { pcm, level } = event.data;
-      // While the phone is speaking a translation, the mic would hear it: send silence instead.
-      const echo = this.speak && performance.now() < this.quietUntil;
-      this.cb.onLevel?.(echo ? 0 : Math.min(1, level * 4));
-      this.send(echo ? this.silence : pcm);
-    };
+    this.node.port.onmessage = (event: MessageEvent<{ pcm: ArrayBuffer; level: number }>) => this.feed(event.data.pcm, event.data.level);
     this.source.connect(this.node).connect(this.sink).connect(ctx.destination);
   }
 
-  private send(pcm: ArrayBuffer) {
+  /**
+   * One 100 ms mic chunk (PCM16 at 16 kHz and its RMS). The app marks where each utterance starts and
+   * ends; 0.4 s from before the start goes along so the first syllable is not lost.
+   */
+  feed(pcm: ArrayBuffer, rms: number) {
+    // While the phone is speaking a translation, the mic would hear it: treat it as silence.
+    const echo = this.speak && performance.now() < this.quietUntil;
+    const level = echo ? 0 : Math.min(1, rms * 4);
+    const chunk = echo ? this.silence : pcm;
+    this.cb.onLevel?.(level);
+    const event = this.gate.feed(level, 100);
+    if (!this.ready) return;
+    if (!this.inTurn) {
+      this.preroll.push(chunk);
+      if (this.preroll.length > 4) this.preroll.shift();
+      if (event !== 'start') return;
+      this.inTurn = true;
+      this.sendJson({ realtimeInput: { activityStart: {} } });
+      for (const piece of this.preroll) this.send(piece);
+      this.preroll = [];
+      return;
+    }
+    this.send(chunk);
+    if (event === 'end') {
+      this.inTurn = false;
+      this.sendJson({ realtimeInput: { activityEnd: {} } });
+    }
+  }
+
+  private sendJson(message: unknown) {
     const ws = this.ws;
     if (!this.ready || !ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ realtimeInput: { audio: { data: toBase64(pcm), mimeType: 'audio/pcm;rate=16000' } } }));
+    ws.send(JSON.stringify(message));
+  }
+
+  private send(pcm: ArrayBuffer) {
+    this.sendJson({ realtimeInput: { audio: { data: toBase64(pcm), mimeType: 'audio/pcm;rate=16000' } } });
   }
 
   private connect() {
@@ -244,6 +310,34 @@ export class LiveInterpreter {
     this.ws = ws;
     this.ready = false;
     let setupDone = false;
+    let ended = false;
+    let stable: number | undefined;
+    // One place decides what happens when this socket stops working, however that shows up.
+    const end = (failure: LiveFailure) => {
+      if (ended) return;
+      ended = true;
+      this.cancel(setupTimer);
+      this.cancel(stable);
+      if (this.ws !== ws || this.stopped) return;
+      this.ready = false;
+      if (!setupDone) {
+        this.ws = undefined;
+        try {
+          ws.close();
+        } catch {
+          /* ignore */
+        }
+        if (failure !== 'key' && this.modelIndex < this.models.length - 1) {
+          this.modelIndex++;
+          this.connect();
+          return;
+        }
+        this.fail(failure);
+        return;
+      }
+      this.reconnect(ws, 300 * (this.reconnects + 1));
+    };
+    const setupTimer = this.later(() => end('busy'), SETUP_TIMEOUT_MS);
     ws.onopen = () =>
       ws.send(
         JSON.stringify({
@@ -251,9 +345,8 @@ export class LiveInterpreter {
             model: `models/${model}`,
             generationConfig: { responseModalities: ['AUDIO'] },
             systemInstruction: { parts: [{ text: this.cfg.system }] },
-            realtimeInputConfig: {
-              automaticActivityDetection: { silenceDurationMs: 1000, endOfSpeechSensitivity: 'END_SENSITIVITY_LOW' },
-            },
+            // The app marks each turn itself (TurnGate): Google's own detection cut sentences short.
+            realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
             inputAudioTranscription: {},
             outputAudioTranscription: {},
           },
@@ -271,48 +364,45 @@ export class LiveInterpreter {
       if (message.setupComplete) {
         setupDone = true;
         this.ready = true;
-        this.reconnects = 0;
+        // A fresh line starts between turns; someone still talking is picked up again within 0.2 s.
+        this.gate.reset();
+        this.inTurn = false;
+        this.preroll = [];
+        this.cancel(setupTimer);
+        stable = this.later(() => (this.reconnects = 0), STABLE_MS);
         this.cb.onState?.('listening');
         return;
       }
       if (message.goAway) {
         // The server is about to end this session (time limit): open a fresh one now.
+        ended = true;
+        this.cancel(stable);
         this.reconnect(ws, 0);
         return;
       }
       this.handle(message.serverContent, model);
     };
-    ws.onclose = (event) => {
-      if (this.ws !== ws || this.stopped) return;
-      this.ready = false;
-      if (!setupDone) {
-        const failure = classifyClose(event.code, event.reason || '');
-        if (failure !== 'key' && this.modelIndex < this.models.length - 1) {
-          this.modelIndex++;
-          this.connect();
-          return;
-        }
-        this.fail(failure);
-        return;
-      }
-      this.reconnect(ws, 300 * (this.reconnects + 1));
-    };
+    ws.onclose = (event) => end(classifyClose(event.code, event.reason || ''));
   }
 
   private reconnect(old: WebSocket, delay: number) {
     if (this.stopped) return;
-    if (this.reconnects++ >= 4) {
+    if (this.reconnects++ >= MAX_RECONNECTS) {
       this.fail('network');
       return;
     }
     this.cb.onState?.('reconnecting');
     this.ws = undefined;
+    this.ready = false;
     try {
       old.close(1000, 'reconnect');
     } catch {
       /* ignore */
     }
-    window.setTimeout(() => this.connect(), delay);
+    // Half a sentence from the old line cannot be finished on the new one.
+    this.cur = { input: '', output: '' };
+    this.cb.onCaption?.({ ...this.cur });
+    this.later(() => this.connect(), delay);
   }
 
   private handle(content: any, model: string) {
@@ -333,7 +423,10 @@ export class LiveInterpreter {
     }
     if (changed) this.cb.onCaption?.({ ...this.cur });
     if (content.turnComplete) {
-      if (this.cur.input.trim() || this.cur.output.trim()) this.cb.onTurn?.({ ...this.cur, model });
+      if (this.cur.input.trim() || this.cur.output.trim()) {
+        this.reconnects = 0;
+        this.cb.onTurn?.({ ...this.cur, model });
+      }
       this.cur = { input: '', output: '' };
       this.cb.onCaption?.({ ...this.cur });
       this.cb.onState?.('listening');

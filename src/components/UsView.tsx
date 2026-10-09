@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Recorder, type Recording } from '../lib/audio';
 import { callGemini, GeminiError, MODELS, modelHealth, probeModel, recentLog } from '../lib/gemini';
 import { daysTogether, FILL_SCHEMA, fillPrompt, systemPrompt } from '../lib/prompts';
@@ -190,16 +190,21 @@ function WordSheet({ item, onClose }: { item: GlossaryItem | null; onClose: () =
   const [noteText, setNoteText] = useState(item?.note || '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ text: string; kind: string } | null>(null);
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), []);
 
   async function save() {
     let k = ko.trim();
     let j = ja.trim();
-    if (!k && !j) return;
+    if ((!k && !j) || request.current) return;
     if ((!k || !j) && app.settings.apiKey) {
+      const controller = new AbortController();
+      request.current = controller;
       setBusy(true);
       setError(null);
       try {
         const result = await callGemini<{ ko: string; ja: string }>({
+          signal: controller.signal,
           key: app.settings.apiKey,
           system: systemPrompt(app.profile, app.glossary),
           parts: [{ text: fillPrompt({ ko: k, ja: j, note: noteText }) }],
@@ -210,10 +215,13 @@ function WordSheet({ item, onClose }: { item: GlossaryItem | null; onClose: () =
         k = k || String(result.data.ko || '').trim();
         j = j || String(result.data.ja || '').trim();
       } catch (caught) {
+        request.current = null;
+        if (controller.signal.aborted) return;
         setBusy(false);
         setError({ text: app.errorText(caught), kind: caught instanceof GeminiError ? caught.kind : '' });
         return;
       }
+      request.current = null;
       setBusy(false);
     }
     const next: GlossaryItem = { id: item?.id || uid(), ko: k, ja: j, note: noteText.trim() || undefined };

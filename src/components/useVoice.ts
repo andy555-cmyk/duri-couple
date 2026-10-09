@@ -44,7 +44,17 @@ export function useVoice(onDone: (recording: Recording) => void, onError: (error
     unlockSpeech();
     stopSpeaking();
     if (recorder.current) return;
-    const next = new Recorder({ onLevel: setLevel, onAutoStop: () => void stop(), autoEnd: !!autoEnd.current });
+    const next = new Recorder({
+      onLevel: setLevel,
+      onAutoStop: () => void stop(),
+      onBroken: () => {
+        if (recorder.current !== next) return;
+        recorder.current = null;
+        setRecording(false);
+        setLevel(0);
+      },
+      autoEnd: !!autoEnd.current,
+    });
     recorder.current = next;
     try {
       const started = await next.start();
@@ -70,15 +80,20 @@ export function useVoice(onDone: (recording: Recording) => void, onError: (error
   const toggle = useCallback(() => (recorder.current ? stop() : start()), [start, stop]);
 
   useEffect(() => {
-    // Leaving the screen or the app always releases the microphone.
+    // Leaving the screen or the app always releases the microphone; iOS may only send
+    // visibilitychange when switching apps (Codex review2 M6).
     const release = () => {
-      recorder.current?.cancel();
+      if (!recorder.current) return;
+      recorder.current.cancel();
       recorder.current = null;
       setRecording(false);
     };
+    const onHide = () => document.hidden && release();
     window.addEventListener('pagehide', release);
+    document.addEventListener('visibilitychange', onHide);
     return () => {
       window.removeEventListener('pagehide', release);
+      document.removeEventListener('visibilitychange', onHide);
       recorder.current?.cancel();
     };
   }, []);

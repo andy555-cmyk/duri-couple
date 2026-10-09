@@ -69,6 +69,9 @@ export interface GlossaryItem {
   note?: string;
 }
 
+/** How someone talks: Japanese differs a lot by gender (俺/僕 vs 私), so translations follow it. '' = not set. */
+export type Gender = '' | 'm' | 'f';
+
 export interface Profile {
   myLang: Lang;
   myName: string;
@@ -77,6 +80,8 @@ export interface Profile {
   meCalls: string;
   partnerCalls: string;
   style: 'casual' | 'polite';
+  meGender: Gender;
+  partnerGender: Gender;
 }
 
 export interface Settings {

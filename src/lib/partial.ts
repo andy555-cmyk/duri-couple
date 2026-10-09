@@ -61,8 +61,8 @@ export function parsePartial<T = Record<string, unknown>>(text: string): Partial
     if (c === '[') return arr(depth + 1);
     if (c === '"') return str();
     const m = /^(?:true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(s.slice(i, i + 40));
-    // A literal touching the end of the text may still be growing (e.g. "tru" or "12").
-    if (m && i + m[0].length < s.length) {
+    // A literal is only trusted once a delimiter follows it: "tru", "12" or "1e" may still be growing.
+    if (m && /[\s,}\]]/.test(s[i + m[0].length] ?? '')) {
       i += m[0].length;
       return { v: JSON.parse(m[0]), ok: true };
     }
@@ -95,6 +95,12 @@ export function parsePartial<T = Record<string, unknown>>(text: string): Partial
         if (depth === 1) open = key.v;
         return { v: o, ok: false };
       }
+      // A value only counts as finished once the separator after it has arrived (Codex review2 M1).
+      ws();
+      if (i >= s.length || (s[i] !== ',' && s[i] !== '}')) {
+        if (depth === 1) open = key.v;
+        return { v: o, ok: false };
+      }
     }
   }
 
@@ -115,6 +121,8 @@ export function parsePartial<T = Record<string, unknown>>(text: string): Partial
       const val = value(depth);
       if (val.v !== undefined) a.push(val.v);
       if (!val.ok) return { v: a, ok: false };
+      ws();
+      if (i >= s.length || (s[i] !== ',' && s[i] !== ']')) return { v: a, ok: false };
     }
   }
 

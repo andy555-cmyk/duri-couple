@@ -1,4 +1,5 @@
-import type { Daily, GlossaryItem, Lang, Line, Profile, Tone, Turn, Word } from './types';
+import { isKanaOnly, kanaToHangul, koreanToKatakana, tidyJapanese, tidyKorean } from './kana';
+import type { Daily, Gender, GlossaryItem, Lang, Line, Profile, Tone, Turn, Word } from './types';
 import { other } from './types';
 
 const LANG = { ko: 'Korean', ja: 'Japanese' } as const;
@@ -34,7 +35,30 @@ export const cleanReading = (text: string | undefined, script: 'kana' | 'hangul'
 
 /** Removes furigana like 今日(きょう) that weaker models sometimes add. */
 export const stripFurigana = (text: string) => text.replace(/([\u4e00-\u9fff\u3005]+)[(（][\u3041-\u3096\u30a1-\u30faー]+[)）]/g, '$1');
-const SCRIPT = { ko: 'hangul', ja: 'katakana' } as const;
+
+/** Quoted phrases may legitimately be in the other language (「사랑해」って言って). */
+const unquoted = (text: string) => text.replace(/「[^」]*」|『[^』]*』|"[^"]*"|“[^”]*”/g, '');
+const ANY_HANGUL = /[\uac00-\ud7a3\u3131-\u318e]/;
+const ANY_JAPANESE = /[\u3041-\u3096\u30a1-\u30fa\u31f0-\u31ff\u4e00-\u9fff\u3005]/;
+
+/**
+ * Text in one language with no stray characters of the other: シ오리 or ㅇㅇ in Japanese, 本当 in
+ * Korean are defects in a translation (Codex review2 M7). Quoted phrases are allowed.
+ */
+export function cleanIn(text: string, lang: Lang): boolean {
+  if (!looksLike(text, lang)) return false;
+  const bare = unquoted(text);
+  return lang === 'ja' ? !ANY_HANGUL.test(bare) : !ANY_JAPANESE.test(bare);
+}
+
+/** Tidies chat habits for the language, then removes furigana. */
+export const tidyIn = (text: string, lang: Lang) => stripFurigana(lang === 'ja' ? tidyJapanese(text.trim()) : tidyKorean(text.trim()));
+
+/** Reading of a Japanese text in hangul, from the model's pronunciation kana. */
+export const jaReading = (kana: string | undefined) => (kana && isKanaOnly(kana) ? kanaToHangul(kana) : '');
+
+/** Reading of a line in the viewer's script: Korean by rule, Japanese from the model's kana. */
+export const readingFor = (text: string, lang: Lang, kana?: string) => (lang === 'ko' ? koreanToKatakana(text) : jaReading(kana));
 
 const TONE: Record<Tone, string> = {
   sweet: 'sweet and affectionate',
@@ -54,6 +78,43 @@ export function names(profile: Profile) {
   };
 }
 
+// What a term of address says about who uses it and who hears it: [term, speaker, listener].
+const ADDRESS_GENDER: [RegExp, Gender, Gender][] = [
+  [/오빠|オッパ|おっぱ/, 'f', 'm'],
+  [/언니|オンニ|おんに/, 'f', 'f'],
+  [/누나|ヌナ|ぬな/, 'm', 'f'],
+  [/^(?:형|형님|형아)$|ヒョン/, 'm', 'm'],
+];
+
+/** When the profile leaves gender open, 오빠/언니/누나/형 in the nicknames still tell (she calls him オッパ). */
+export function inferGenders(profile: Profile): { me: Gender; partner: Gender } {
+  let me: Gender = '';
+  let partner: Gender = '';
+  for (const [term, speaker, listener] of ADDRESS_GENDER) {
+    if (term.test(profile.partnerCalls.trim())) {
+      partner ||= speaker;
+      me ||= listener;
+    }
+    if (term.test(profile.meCalls.trim())) {
+      me ||= speaker;
+      partner ||= listener;
+    }
+  }
+  return { me, partner };
+}
+
+/** Gender of the Korean speaker and of the Japanese speaker: as set in the profile, else as the nicknames imply. */
+export function genders(profile: Profile): { ko: string; ja: string } {
+  const label = (g: string | undefined) => (g === 'm' ? 'a man' : g === 'f' ? 'a woman' : '');
+  const guess = inferGenders(profile);
+  const me = profile.meGender || guess.me;
+  const partner = profile.partnerGender || guess.partner;
+  return profile.myLang === 'ko' ? { ko: label(me), ja: label(partner) } : { ko: label(partner), ja: label(me) };
+}
+
+const VOICE_RULE =
+  'Each person keeps their own voice. In Japanese a man says 俺 or 僕 with masculine casual endings (〜だよ, 〜んだ, 〜だな); a woman says 私 or あたし with her own natural endings; leave the pronoun out when natural Japanese would.';
+
 export function daysTogether(startDate: string, today = new Date()): number | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) return null;
   const [y, m, d] = startDate.split('-').map(Number);
@@ -66,6 +127,7 @@ export function daysTogether(startDate: string, today = new Date()): number | nu
 /** Shared rules for every request: who they are, register, dictionary, how to write readings. */
 export function systemPrompt(profile: Profile, glossary: GlossaryItem[], today = new Date()): string {
   const n = names(profile);
+  const g = genders(profile);
   const days = daysTogether(profile.startDate, today);
   const koCalls = profile.myLang === 'ko' ? profile.meCalls : profile.partnerCalls;
   const jaCalls = profile.myLang === 'ja' ? profile.meCalls : profile.partnerCalls;
@@ -80,22 +142,24 @@ export function systemPrompt(profile: Profile, glossary: GlossaryItem[], today =
 
   return [
     `You are Duri, the private interpreter and language coach of one couple.`,
-    `- ${n.ko}: native Korean speaker, learning Japanese.`,
-    `- ${n.ja}: native Japanese speaker, learning Korean.`,
+    `- ${n.ko}: native Korean speaker${g.ko ? `, ${g.ko}` : ''}, learning Japanese.`,
+    `- ${n.ja}: native Japanese speaker${g.ja ? `, ${g.ja}` : ''}, learning Korean.`,
     `They are romantic partners${days ? `, together for ${days} days` : ''}. They talk face to face and by text (LINE/KakaoTalk).`,
     koCalls ? `${n.ko} calls ${n.ja} "${koCalls}".` : '',
     jaCalls ? `${n.ja} calls ${n.ko} "${jaCalls}".` : '',
     ``,
     `TRANSLATION RULES`,
-    `1. Translate what was meant, the way real couples in Korea and Japan actually talk: natural spoken language, never stiff textbook phrasing. Keep the speaker's meaning, feeling and level of detail. Do not add, soften or drop content in the main translation.`,
+    `1. Translate what was meant, the way real couples in Korea and Japan actually talk: natural spoken language, never stiff textbook phrasing. Keep the speaker's meaning, feeling and level of detail. Do not add, soften or drop content in the main translation: no reasons, events or feelings that were not said (수고 많았어 → お疲れ様, never 今日はいろいろあって…), and the same strength of emphasis (one 진짜 → one 本当に).`,
     `2. Register: ${register}, unless the speaker clearly uses another register.`,
     `3. Words in the couple dictionary must be rendered exactly as listed. Never translate personal names: write Korean names in katakana inside Japanese and Japanese names in hangul inside Korean.`,
-    `4. Keep emoji, laughter and interjections natural in the other language (ㅋㅋ ↔ www/笑, ㅎㅎ ↔ ふふ, 헐 ↔ えっ).`,
-    `5. Silently fix obvious speech-recognition slips, but never invent content.`,
+    `4. Terms of address and endearment are translated from the speaker's point of view (자기야/여보 → ねえ or the partner's name; あなた/ねえ → 자기야). Never swap who calls whom: a nickname one person uses for the other must not be put in the other person's mouth. A plain 너/당신 to a lover becomes the partner's name or is left out — not 君, お前 or あなた.`,
+    `5. Keep every person and detail that was mentioned (시오리 엄마 → しおりのお母さん, not just お母さん).`,
+    `6. Japanese text contains only Japanese script, Korean text only hangul (plus emoji/punctuation). Convert chat habits: ㅋㅋ ↔ ｗｗ/笑, ㅎㅎ ↔ ふふ, ㅠㅠ ↔ 😭/(泣), 헐 ↔ えっ.`,
+    `7. Silently fix obvious speech-recognition slips, but never invent content.`,
+    `8. ${VOICE_RULE}${g.ko && g.ja ? '' : ' Where a gender is not given, infer it from terms of address (오빠/オッパ: a woman calling a man; 언니: a woman calling a woman; 형/ヒョン: a man calling a man; 누나/ヌナ: a man calling a woman) and from the conversation; if still unclear, avoid gendered pronouns and endings.'}`,
     ``,
-    `READING RULES (each of them cannot read the other's script)`,
-    `- jaHangul = how the Japanese sounds, written in hangul for a Korean learner. Use the real reading of every kanji in context. っ → ㅅ받침 (行って → 잇테), ん → ㄴ/ㅁ/ㅇ받침 by sound (散歩 → 삼포), long vowels with ー (ありがとう → 아리가토ー, 東京 → 토ー쿄ー), つ → 츠, ず/づ → 즈. Put spaces between words like Korean spacing.`,
-    `- koKana = how the Korean sounds, written in katakana for a Japanese learner, AFTER Korean sound changes (연음·비음화·경음화: 먹어요 → モゴヨ, 감사합니다 → カㇺサハㇺニダ, 같이 → カチ). Final consonants with small katakana: ㄱ→ㇰ ㄴ→ン ㄷ→ㇳ ㄹ→ㇽ ㅁ→ㇺ ㅂ→ㇷ゚ ㅇ→ン. Keep Korean word spacing.`,
+    `PRONUNCIATION KANA (fields named *Kana / kana)`,
+    `Write how the JAPANESE text is pronounced, in hiragana only (no kanji, no hangul, no romaji), covering everything readable including chat marks (笑 → わら): particles as pronounced (は→わ, へ→え, を→お), long vowels with ー (ありがとう → ありがとー, 東京 → とーきょー, 先生 → せんせー), っ and ん as usual, a space between words. Korean text never needs a kana field — leave such fields "".`,
     ``,
     dict.length ? `COUPLE DICTIONARY (Korean = Japanese)\n${dict.join('\n')}` : `COUPLE DICTIONARY: (empty)`,
     ``,
@@ -103,7 +167,7 @@ export function systemPrompt(profile: Profile, glossary: GlossaryItem[], today =
   ]
     .filter((line) => line !== '')
     .join('\n')
-    .replace(/\n(TRANSLATION|READING|COUPLE|Always)/g, '\n\n$1');
+    .replace(/\n(TRANSLATION|PRONUNCIATION|COUPLE|Always)/g, '\n\n$1');
 }
 
 /** Recent turns, oldest first, so pronouns and running jokes carry over. */
@@ -131,15 +195,14 @@ export const TALK_SCHEMA = {
     lang: { type: 'string', enum: ['ko', 'ja'] },
     said: str,
     translation: str,
-    koKana: str,
-    jaHangul: str,
+    jaKana: str,
     alt: str,
-    altReading: str,
+    altKana: str,
     altMeaning: str,
     altWhy: str,
     note: str,
   },
-  required: ['heard', 'lang', 'said', 'translation', 'koKana', 'jaHangul', 'alt', 'altReading', 'altMeaning', 'altWhy', 'note'],
+  required: ['heard', 'lang', 'said', 'translation', 'jaKana', 'alt', 'altKana', 'altMeaning', 'altWhy', 'note'],
 };
 
 export interface TalkJson {
@@ -147,10 +210,9 @@ export interface TalkJson {
   lang: Lang;
   said: string;
   translation: string;
-  koKana: string;
-  jaHangul: string;
+  jaKana: string;
   alt: string;
-  altReading: string;
+  altKana: string;
   altMeaning: string;
   altWhy: string;
   note: string;
@@ -182,48 +244,72 @@ export function talkPrompt(opts: {
     `- lang: "ko" or "ja", the language that was spoken/written.`,
     `- said: exactly what was said, in its own language and script, with clean punctuation.`,
     `- translation: the natural translation into the other language (Korean → Japanese, Japanese → Korean). Plain text, no furigana or brackets.`,
-    `- koKana: katakana ONLY (no hangul) reading of the Korean text (said if lang is ko, otherwise translation).`,
-    `- jaHangul: hangul ONLY (no kana, no kanji) reading of the Japanese text (said if lang is ja, otherwise translation).`,
-    `- alt: ONE line in the other language that a native lover would really say for the same intent, in the wanted tone. Same meaning, may be warmer or more idiomatic. "" if translation is already ideal.`,
-    `- altReading: reading of alt (hangul if alt is Japanese, katakana if alt is Korean), else "".`,
+    `- jaKana: pronunciation kana of the Japanese text (said if lang is ja, otherwise translation).`,
+    `- alt: ONE line, only in the other language, that a native lover would really say for the same intent in the wanted tone — only if it is clearly more natural than translation; otherwise "" (and altKana, altMeaning, altWhy ""). Same meaning: no feeling, action, reason, person, place or source of information that was not said. Check its spelling and grammar.`,
+    `- altKana: pronunciation kana of alt if alt is Japanese, else "".`,
     `- altMeaning: alt translated back into the speaker's language, else "".`,
     `- altWhy: at most one short sentence in the speaker's language on why alt sounds better, else "".`,
-    `- note: "" unless there is a real nuance or culture point the speaker should know (one short sentence in the speaker's language).`,
+    `- note: usually "". Only for a real nuance or culture point the speaker would want to learn: one short sentence in the speaker's own language (Korean if lang is ko, Japanese if ja). Never explain your own word choices, names, the couple dictionary or these rules.`,
   ].join('\n');
 }
 
 export function validateTalk(json: TalkJson): string | null {
   if (json.heard === false) return null;
   const lang: Lang = json.lang === 'ja' ? 'ja' : 'ko';
-  if (!looksLike(json.said || '', lang)) return 'said';
-  if (!looksLike(json.translation || '', other(lang))) return 'translation';
-  if (!readingOk(json.koKana || '', 'kana')) return 'koKana';
-  if (!readingOk(json.jaHangul || '', 'hangul')) return 'jaHangul';
+  // The speaker's own words may mix in the other language (learners do: 오늘 すごく 피곤해); the translation may not.
+  if (!looksLike(tidyIn(json.said || '', lang), lang)) return 'said';
+  if (!cleanIn(tidyIn(json.translation || '', other(lang)), other(lang))) return 'translation';
   return null;
+}
+
+/** Edit distance, for spotting an "alternative" that is the translation with a typo. */
+function distance(a: string, b: string): number {
+  const x = [...a];
+  const y = [...b];
+  let prev = Array.from({ length: y.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= x.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= y.length; j++) row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
+    prev = row;
+  }
+  return prev[y.length];
+}
+
+const bare = (s: string) => s.replace(/[\s。.!！?？、,~〜…]/g, '');
+
+/**
+ * An alternative earns its place only if it is a real alternative: not the translation again with a
+ * letter changed (쉬는 날이래 → 쉬는 날이데), and with a meaning the speaker can read (Codex grading 2026-10-10).
+ */
+export function worthAlt(alt: string, translation: string, meaning: string): boolean {
+  if (!alt || !meaning.trim()) return false;
+  const a = bare(alt);
+  const t = bare(translation);
+  return distance(a, t) > Math.max(2, Math.round(t.length * 0.15));
 }
 
 export function turnFromTalk(json: TalkJson, meta: { channel?: Turn['channel']; input: Turn['input']; model: string; ms: number; id: string; ts: number }): Turn {
   const lang: Lang = json.lang === 'ja' ? 'ja' : 'ko';
-  const said = stripFurigana((json.said || '').trim());
-  const translation = stripFurigana((json.translation || '').trim());
-  let alt = stripFurigana((json.alt || '').trim());
-  if (alt && !looksLike(alt, other(lang))) alt = '';
-  const sameAsTranslation = alt && alt.replace(/[\s。.!！?？、,]/g, '') === translation.replace(/[\s。.!！?？、,]/g, '');
+  const target = other(lang);
+  const said = tidyIn(json.said || '', lang);
+  const translation = tidyIn(json.translation || '', target);
+  let alt = tidyIn(json.alt || '', target);
+  if (alt && (!cleanIn(alt, target) || !worthAlt(alt, translation, json.altMeaning || ''))) alt = '';
+  const ko = lang === 'ko' ? said : translation;
   return {
     id: meta.id,
     ts: meta.ts,
     lang,
     channel: meta.channel || 'talk',
     input: meta.input,
-    ko: lang === 'ko' ? said : translation,
+    ko,
     ja: lang === 'ja' ? said : translation,
-    koKana: cleanReading(json.koKana, 'kana'),
-    jaHangul: cleanReading(json.jaHangul, 'hangul'),
-    alt:
-      alt && !sameAsTranslation
+    koKana: koreanToKatakana(ko),
+    jaHangul: jaReading(json.jaKana),
+    alt: alt
         ? {
             text: alt,
-            reading: (json.altReading || '').trim(),
+            reading: readingFor(alt, target, json.altKana),
             meaning: (json.altMeaning || '').trim(),
             why: (json.altWhy || '').trim(),
           }
@@ -236,8 +322,8 @@ export function turnFromTalk(json: TalkJson, meta: { channel?: Turn['channel']; 
 
 const lineSchema = {
   type: 'object',
-  properties: { label: str, text: str, reading: str, meaning: str, why: str },
-  required: ['label', 'text', 'reading', 'meaning', 'why'],
+  properties: { label: str, text: str, kana: str, meaning: str, why: str },
+  required: ['label', 'text', 'kana', 'meaning', 'why'],
 };
 
 export const UNDERSTAND_SCHEMA = {
@@ -245,32 +331,30 @@ export const UNDERSTAND_SCHEMA = {
   properties: {
     lang: { type: 'string', enum: ['ko', 'ja'] },
     translation: str,
-    koKana: str,
-    jaHangul: str,
+    jaKana: str,
     nuance: str,
     words: {
       type: 'array',
       maxItems: 4,
-      items: { type: 'object', properties: { w: str, r: str, m: str }, required: ['w', 'r', 'm'] },
+      items: { type: 'object', properties: { w: str, kana: str, m: str }, required: ['w', 'kana', 'm'] },
     },
     replies: {
       type: 'array',
       minItems: 3,
       maxItems: 3,
-      items: { type: 'object', properties: { text: str, reading: str, meaning: str }, required: ['text', 'reading', 'meaning'] },
+      items: { type: 'object', properties: { text: str, kana: str, meaning: str }, required: ['text', 'kana', 'meaning'] },
     },
   },
-  required: ['lang', 'translation', 'koKana', 'jaHangul', 'nuance', 'words', 'replies'],
+  required: ['lang', 'translation', 'jaKana', 'nuance', 'words', 'replies'],
 };
 
 export interface UnderstandJson {
   lang: Lang;
   translation: string;
-  koKana: string;
-  jaHangul: string;
+  jaKana: string;
   nuance: string;
-  words: Word[];
-  replies: { text: string; reading: string; meaning: string }[];
+  words: { w: string; kana: string; m: string }[];
+  replies: { text: string; kana: string; meaning: string }[];
 }
 
 export function understandPrompt(opts: { profile: Profile; turns: Turn[]; text: string; now?: number }): string {
@@ -288,41 +372,49 @@ export function understandPrompt(opts: { profile: Profile; turns: Turn[]; text: 
     `Return JSON with exactly these keys:`,
     `- lang: "ko" or "ja", the language the message is written in.`,
     `- translation: natural translation into the other language.`,
-    `- koKana: katakana ONLY reading of the Korean text (message or translation).`,
-    `- jaHangul: hangul ONLY reading of the Japanese text (message or translation).`,
+    `- jaKana: pronunciation kana of the Japanese text (message or translation).`,
     `- nuance: 1–2 short sentences in ${LANG[mine]}: the feeling and intent behind it (e.g. teasing, a little sulky, wants attention, just casual) and anything easy to misread. If the message is written in ${LANG[mine]} (the partner practising), praise kindly and point out anything unnatural.`,
-    `- words: up to 4 useful words or expressions from the message: w = as written, r = reading in ${SCRIPT[mine]}, m = meaning in ${LANG[mine]}. [] if none worth learning.`,
-    `- replies: 3 short natural replies that ${n.me} (the reader) could send back to ${n.partner}, spoken in ${n.me}'s voice. text MUST be written in ${LANG[theirs]} (never ${LANG[mine]}) so ${n.partner} can read it; vary the feel (sweet / playful / simple). reading = reading of text in ${SCRIPT[mine]} only; meaning = text translated into ${LANG[mine]}.`,
+    `- words: up to 4 useful words or expressions from the message: w = as written, kana = its pronunciation kana if it is Japanese else "", m = meaning in ${LANG[mine]}. [] if none worth learning.`,
+    `- replies: 3 short natural replies that ${n.me} (the reader) could send back to ${n.partner}, spoken in ${n.me}'s voice. text MUST be written in ${LANG[theirs]} (never ${LANG[mine]}) so ${n.partner} can read it; vary the feel (sweet / playful / simple). kana = pronunciation kana of text if it is Japanese else ""; meaning = text translated into ${LANG[mine]}.`,
   ].join('\n');
 }
 
 export function validateUnderstand(json: UnderstandJson, profile: Profile): string | null {
   const lang: Lang = json.lang === 'ko' ? 'ko' : 'ja';
-  if (!looksLike(json.translation || '', other(lang))) return 'translation';
+  if (!cleanIn(tidyIn(json.translation || '', other(lang)), other(lang))) return 'translation';
   const theirs = other(profile.myLang);
-  if (!(json.replies || []).length || json.replies.some((r) => !looksLike(r?.text || '', theirs))) return 'replies';
-  if (!readingOk(json.koKana || '', 'kana') || !readingOk(json.jaHangul || '', 'hangul')) return 'reading';
+  if ((json.replies || []).length !== 3 || json.replies.some((r) => !cleanIn(tidyIn(r?.text || '', theirs), theirs))) return 'replies';
   return null;
 }
 
 export function turnFromUnderstand(json: UnderstandJson, text: string, meta: { model: string; ms: number; id: string; ts: number; myLang: Lang }): Turn {
   const lang: Lang = json.lang === 'ko' ? 'ko' : 'ja';
+  const theirs = other(meta.myLang);
+  const translation = tidyIn(json.translation || '', other(lang));
+  const ko = lang === 'ko' ? text : translation;
   return {
     id: meta.id,
     ts: meta.ts,
     lang,
     channel: 'msg-in',
     input: 'text',
-    ko: lang === 'ko' ? text : stripFurigana((json.translation || '').trim()),
-    ja: lang === 'ja' ? text : stripFurigana((json.translation || '').trim()),
-    koKana: cleanReading(json.koKana, 'kana'),
-    jaHangul: cleanReading(json.jaHangul, 'hangul'),
+    ko,
+    ja: lang === 'ja' ? text : translation,
+    koKana: koreanToKatakana(ko),
+    jaHangul: jaReading(json.jaKana),
     nuance: (json.nuance || '').trim() || undefined,
-    words: (json.words || []).filter((w) => w?.w).slice(0, 4),
+    words: (json.words || [])
+      .filter((w) => w?.w)
+      .slice(0, 4)
+      .map((w): Word => {
+        const wordLang: Lang = looksLike(w.w, 'ja') && !looksLike(w.w, 'ko') ? 'ja' : 'ko';
+        return { w: w.w, r: wordLang === meta.myLang ? '' : readingFor(w.w, wordLang, w.kana), m: w.m };
+      }),
     lines: (json.replies || [])
-      .filter((r) => r?.text && looksLike(r.text, other(meta.myLang)))
+      .map((r) => ({ ...r, text: tidyIn(r?.text || '', theirs) }))
+      .filter((r) => r.text && cleanIn(r.text, theirs))
       .slice(0, 3)
-      .map((r) => ({ ...r, text: stripFurigana(r.text), reading: cleanReading(r.reading, meta.myLang === 'ko' ? 'hangul' : 'kana') })),
+      .map((r): Line => ({ text: r.text, reading: readingFor(r.text, theirs, r.kana), meaning: (r.meaning || '').trim() })),
     model: meta.model,
     ms: meta.ms,
   };
@@ -332,17 +424,17 @@ export const WRITE_SCHEMA = {
   type: 'object',
   properties: {
     said: str,
+    saidKana: str,
     lines: { type: 'array', minItems: 3, maxItems: 3, items: lineSchema },
-    myKana: str,
     note: str,
   },
-  required: ['said', 'lines', 'myKana', 'note'],
+  required: ['said', 'saidKana', 'lines', 'note'],
 };
 
 export interface WriteJson {
   said: string;
-  lines: Line[];
-  myKana: string;
+  saidKana: string;
+  lines: { label: string; text: string; kana: string; meaning: string; why: string }[];
   note: string;
 }
 
@@ -370,11 +462,11 @@ export function writePrompt(opts: {
     ``,
     `Return JSON with exactly these keys:`,
     `- said: what ${n.me} wants to say, cleaned up, in ${LANG[mine]}.`,
+    `- saidKana: pronunciation kana of said if it is Japanese, else "".`,
     `- lines: exactly 3 messages, each text written in ${LANG[theirs]} (never ${LANG[mine]}), the way a native ${LANG[theirs]} lover would actually text it, in ${n.me}'s voice:`,
     `  1) faithful and natural, 2) in the wanted tone, 3) shorter and more casual. Each has:`,
-    `  label = 2–4 words in ${LANG[mine]} naming the style; text (in ${LANG[theirs]}); reading = reading of text in ${SCRIPT[mine]} only; meaning = back-translation into ${LANG[mine]}; why = at most one short sentence in ${LANG[mine]}.`,
-    `- myKana: reading of "said" in ${SCRIPT[theirs]} (katakana for Korean, hangul for Japanese).`,
-    `- note: "" or one short tip in ${LANG[mine]} if something could be misread.`,
+    `  label = 2–4 words in ${LANG[mine]} naming the style; text (in ${LANG[theirs]}); kana = pronunciation kana of text if it is Japanese else ""; meaning = back-translation into ${LANG[mine]}; why = at most one short sentence in ${LANG[mine]}.`,
+    `- note: "" or one short tip in ${LANG[mine]} if something could be misread. Never explain your own word choices, names or the couple dictionary.`,
   ]
     .filter((line) => line !== '')
     .join('\n');
@@ -382,30 +474,36 @@ export function writePrompt(opts: {
 
 export function validateWrite(json: WriteJson, profile: Profile): string | null {
   const lines = json.lines || [];
-  const theirs = other(profile.myLang);
-  if (!lines.length || lines.some((l) => !looksLike(l?.text || '', theirs))) return 'lines';
-  if (lines.some((l) => !readingOk(l?.reading || '', profile.myLang === 'ko' ? 'hangul' : 'kana'))) return 'reading';
+  const mine = profile.myLang;
+  const theirs = other(mine);
+  if (lines.length !== 3 || lines.some((l) => !cleanIn(tidyIn(l?.text || '', theirs), theirs))) return 'lines';
+  if (!looksLike(tidyIn(json.said || '', mine), mine)) return 'said';
   return null;
 }
 
 export function turnFromWrite(json: WriteJson, meta: { profile: Profile; input: Turn['input']; model: string; ms: number; id: string; ts: number }): Turn {
   const mine = meta.profile.myLang;
-  const lines = (json.lines || [])
-    .filter((l) => l?.text && looksLike(l.text, other(mine)))
+  const theirs = other(mine);
+  const lines: Line[] = (json.lines || [])
+    .map((l) => ({ ...l, text: tidyIn(l?.text || '', theirs) }))
+    .filter((l) => l.text && cleanIn(l.text, theirs))
     .slice(0, 3)
-    .map((l) => ({ ...l, text: stripFurigana(l.text), reading: cleanReading(l.reading, mine === 'ko' ? 'hangul' : 'kana') }));
-  const first = lines[0] || { text: '', reading: '' };
-  const said = (json.said || '').trim();
+    .map((l) => ({ label: l.label, text: l.text, reading: readingFor(l.text, theirs, l.kana), meaning: (l.meaning || '').trim(), why: (l.why || '').trim() }));
+  const firstRaw = (json.lines || []).find((l) => l && tidyIn(l.text || '', theirs) === lines[0]?.text);
+  const cleaned = tidyIn(json.said || '', mine);
+  // A wrong-language "said" would put the partner's language into my side of the record.
+  const said = looksLike(cleaned, mine) ? cleaned : lines[0]?.meaning && looksLike(lines[0].meaning, mine) ? lines[0].meaning : cleaned;
+  const ko = mine === 'ko' ? said : lines[0]?.text || '';
   return {
     id: meta.id,
     ts: meta.ts,
     lang: mine,
     channel: 'msg-out',
     input: meta.input,
-    ko: mine === 'ko' ? said : first.text,
-    ja: mine === 'ja' ? said : first.text,
-    koKana: mine === 'ko' ? cleanReading(json.myKana, 'kana') : cleanReading(first.reading, 'kana'),
-    jaHangul: mine === 'ja' ? cleanReading(json.myKana, 'hangul') : cleanReading(first.reading, 'hangul'),
+    ko,
+    ja: mine === 'ja' ? said : lines[0]?.text || '',
+    koKana: koreanToKatakana(ko),
+    jaHangul: mine === 'ja' ? jaReading(json.saidKana) : jaReading(firstRaw?.kana),
     lines,
     note: (json.note || '').trim() || undefined,
     model: meta.model,
@@ -448,15 +546,14 @@ export function pronouncePrompt(opts: { profile: Profile; target: string; target
 
 export const DAILY_SCHEMA = {
   type: 'object',
-  properties: { line: str, meaning: str, koKana: str, jaHangul: str, note: str },
-  required: ['line', 'meaning', 'koKana', 'jaHangul', 'note'],
+  properties: { line: str, meaning: str, kana: str, note: str },
+  required: ['line', 'meaning', 'kana', 'note'],
 };
 
 export interface DailyJson {
   line: string;
   meaning: string;
-  koKana: string;
-  jaHangul: string;
+  kana: string;
   note: string;
 }
 
@@ -478,26 +575,29 @@ export function dailyPrompt(opts: { profile: Profile; turns: Turn[]; known: stri
     `Return JSON with exactly these keys:`,
     `- line: the line, written in ${LANG[theirs]} (never ${LANG[mine]}), in ${n.me}'s voice speaking to ${n.partner}.`,
     `- meaning: its meaning in ${LANG[mine]}.`,
-    `- koKana: katakana reading of the Korean text (line or meaning).`,
-    `- jaHangul: hangul reading of the Japanese text (line or meaning).`,
+    `- kana: pronunciation kana of whichever of line/meaning is Japanese.`,
     `- note: one short sentence in ${LANG[mine]} on when to use it.`,
   ].join('\n');
 }
 
 export function validateDaily(json: DailyJson, profile: Profile): string | null {
-  if (!looksLike(json.line || '', other(profile.myLang))) return 'line';
+  const theirs = other(profile.myLang);
+  if (!cleanIn(tidyIn(json.line || '', theirs), theirs)) return 'line';
   if (!looksLike(json.meaning || '', profile.myLang)) return 'meaning';
   return null;
 }
 
 export function dailyFrom(json: DailyJson, profile: Profile, date: string): Daily {
   const theirs = other(profile.myLang);
+  const line = tidyIn(json.line || '', theirs);
+  const meaning = tidyIn(json.meaning || '', profile.myLang);
+  const ko = theirs === 'ko' ? line : meaning;
   return {
     date,
-    ko: stripFurigana(theirs === 'ko' ? json.line : json.meaning),
-    ja: stripFurigana(theirs === 'ja' ? json.line : json.meaning),
-    koKana: json.koKana || '',
-    jaHangul: json.jaHangul || '',
+    ko,
+    ja: theirs === 'ja' ? line : meaning,
+    koKana: koreanToKatakana(ko),
+    jaHangul: jaReading(json.kana),
     note: json.note || '',
   };
 }
@@ -526,6 +626,7 @@ export function fillPrompt(item: { ko: string; ja: string; note?: string }): str
  */
 export function livePrompt(profile: Profile, glossary: GlossaryItem[]): string {
   const n = names(profile);
+  const g = genders(profile);
   const casual = profile.style !== 'polite';
   const dict = glossary
     .filter((g) => g.ko.trim() && g.ja.trim())
@@ -540,6 +641,7 @@ export function livePrompt(profile: Profile, glossary: GlossaryItem[]): string {
     'Keep the meaning exactly. Never answer, comment, greet or add anything: speak only the translation, warmly, in the speaker\'s mood.',
     'Translate only the words you actually heard in this utterance. If it sounds cut off, translate just that fragment. Never guess and never reuse an earlier sentence.',
     `Personal names are never translated: ${n.ko} and ${n.ja} keep their sound in the other language.`,
+    g.ko || g.ja ? `${[g.ko && `${n.ko} is ${g.ko}`, g.ja && `${n.ja} is ${g.ja}`].filter(Boolean).join(' and ')}. ${VOICE_RULE}` : '',
     dict ? `Couple dictionary (always use these words): ${dict}.` : '',
   ]
     .filter(Boolean)
@@ -548,22 +650,16 @@ export function livePrompt(profile: Profile, glossary: GlossaryItem[]): string {
 
 export const READINGS_SCHEMA = {
   type: 'object',
-  properties: { koKana: str, jaHangul: str },
-  required: ['koKana', 'jaHangul'],
+  properties: { jaKana: str },
+  required: ['jaKana'],
 };
 
-export function readingsPrompt(ko: string, ja: string): string {
-  return [
-    `Korean: «${ko}»`,
-    `Japanese: «${ja}»`,
-    'Return JSON: {"koKana": katakana ONLY reading of the Korean, "jaHangul": hangul ONLY reading of the Japanese}, following the reading rules.',
-  ].join('\n');
+export function readingsPrompt(ja: string): string {
+  return [`Japanese: «${ja}»`, 'Return JSON: {"jaKana": pronunciation kana of this Japanese text}.'].join('\n');
 }
 
-export function validateReadings(json: { koKana: string; jaHangul: string }): string | null {
-  if (!readingOk(json.koKana || '', 'kana') || !String(json.koKana || '').trim()) return 'koKana';
-  if (!readingOk(json.jaHangul || '', 'hangul') || !String(json.jaHangul || '').trim()) return 'jaHangul';
-  return null;
+export function validateReadings(json: { jaKana: string }): string | null {
+  return isKanaOnly(json.jaKana || '') ? null : 'jaKana';
 }
 
 /** A finished live exchange becomes an ordinary turn (readings are filled in afterwards). */
@@ -573,15 +669,17 @@ export function turnFromLive(input: string, output: string, meta: { id: string; 
   if (!said || !heard) return null;
   const lang: Lang = looksLike(said, 'ja') && !looksLike(said, 'ko') ? 'ja' : 'ko';
   if (!looksLike(heard, other(lang))) return null;
+  const ko = lang === 'ko' ? said : heard;
   return {
     id: meta.id,
     ts: meta.ts,
     lang,
     channel: 'talk',
     input: 'voice',
-    ko: lang === 'ko' ? said : heard,
+    ko,
     ja: lang === 'ja' ? said : heard,
-    koKana: '',
+    // Korean is read by rule right away; the Japanese reading needs the model and is filled in later.
+    koKana: koreanToKatakana(ko),
     jaHangul: '',
     model: meta.model,
   };
